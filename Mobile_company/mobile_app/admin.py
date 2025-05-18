@@ -1,0 +1,23 @@
+from django.contrib import admin
+from .models import City,Job,Branch,Employee,ProductCategory,Product,Accessories,AccessoriesType,Brand,Color,Camera,Phone,BranchProducts,Customer,Purchase,SoldProduct,BranchOrder,RequestedProducts,ProductTransaction,TransportedProducts
+# Register your models here.
+admin.site.register(City)
+admin.site.register(Job)
+admin.site.register(Branch)
+admin.site.register(Employee)
+admin.site.register(ProductCategory)
+admin.site.register(Product)
+admin.site.register(Accessories)
+admin.site.register(AccessoriesType)
+admin.site.register(Brand)
+admin.site.register(Color)
+admin.site.register(Camera)
+admin.site.register(Phone)
+admin.site.register(BranchProducts)
+admin.site.register(Customer)
+admin.site.register(Purchase)
+admin.site.register(SoldProduct)
+admin.site.register(BranchOrder)
+admin.site.register(RequestedProducts)
+admin.site.register(ProductTransaction)
+admin.site.register(TransportedProducts)
