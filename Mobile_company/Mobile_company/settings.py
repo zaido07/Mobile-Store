@@ -26,6 +26,7 @@ SECRET_KEY = 'django-insecure-pnutw#qa&#7c@bow&f8g4a99$8%+y0f^l8nzjnsa=slmlhv542
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
+
 ALLOWED_HOSTS = []
 
 
@@ -41,8 +42,10 @@ INSTALLED_APPS = [
     'mobile_app',
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'django_filters',
+    'drf_spectacular'
 ]
 #default rest_framework classes permissions and authentication
 REST_FRAMEWORK = {
@@ -52,7 +55,8 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
-    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend']
+    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     
 }
 PDFKIT_CONFIG = {
@@ -62,9 +66,11 @@ PDFKIT_CONFIG = {
 from datetime import timedelta
 #Tokens lifetime
 SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1,minutes=30),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
     'BLACKLIST_AFTER_ROTATION': True,
     'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
 }
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -75,6 +81,7 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    'mobile_app.middleware.ActivityLogMiddleware',
 ]
 #cors headers
 CORS_ORIGIN_ALLOW_ALL=True
@@ -97,6 +104,10 @@ TEMPLATES = [
         },
     },
 ]
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 WSGI_APPLICATION = 'Mobile_company.wsgi.application'
 
@@ -107,7 +118,7 @@ WSGI_APPLICATION = 'Mobile_company.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME':'new_tech',
+        'NAME':'NewTech_',
         'USER':'root',
         'PASSWORD':'zaidRTX20036IX9INE*****',
         'HOST':'localhost',

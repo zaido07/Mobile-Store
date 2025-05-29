@@ -1,7 +1,11 @@
+from.models import *
 from rest_framework import serializers
-from .models import *
+from rest_framework_simplejwt.tokens import RefreshToken,AccessToken
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from django.db.models import Sum,F
+from django.db.models import Sum,F,Count,Q
+from django.core.cache import cache
+import time
 class CitySerializer(serializers.ModelSerializer):
     class Meta:
         model = City
@@ -17,55 +21,491 @@ class EmployeeSerializer(serializers.ModelSerializer):
         model = Employee
         fields = '__all__'
 
+class ManageEmployeeSerializer(serializers.ModelSerializer):
+    manager_name=serializers.SerializerMethodField()
+    job_name=serializers.CharField(source='job_id.job_name',read_only=True)
+    branch_location=serializers.CharField(source='branch_id.location',read_only=True)
+    
+    
+    class Meta:
+        model=Employee
+        fields=['manager_name','job_name','branch_location','id']
+    def get_manager_name(self,obj):
+        return f"{obj.f_name} {obj.middle_name} {obj.l_name}"
+
+class AddBranchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model=Branch
+        fields='__all__'
+        
+        
+        
 class BranchSerializer(serializers.ModelSerializer):
+    manager_name = serializers.SerializerMethodField()
     class Meta:
         model = Branch
-        fields = '__all__'
-
+        fields = ['manager_id','city_id','location','branch_number','manager_name']
+        extra_kwargs = {
+            'city_id': {
+                'read_only': True  
+            }
+        }
+    def get_manager_name(self, obj):
+            if obj.manager_id:
+                return f"{obj.manager_id.f_name} {obj.manager_id.l_name}"
+            return None
+    
 class ProductCategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductCategory
         fields = '__all__'
 
+# serializers.py
 class ProductSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source='category_id.category_name', read_only=True)
+    
     class Meta:
         model = Product
-        fields = '__all__'
-
-class AccessoriesTypeSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AccessoriesType
-        fields = '__all__'
+        fields = [
+            'product_id',
+            'product_name', 
+            'category_id',
+            'category_name',
+            'main_price',
+            'sale_price',
+            'quantity'
+        ]
+        extra_kwargs = {
+            'product_id': {'read_only': True}
+        }
 
 class AccessoriesSerializer(serializers.ModelSerializer):
+    product_id = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    
     class Meta:
         model = Accessories
         fields = '__all__'
 
-class BrandSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Brand
-        fields = '__all__'
 
-class ColorSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Color
-        fields = '__all__'
-
+# serializers.py
 class CameraSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camera
         fields = '__all__'
-
 class PhoneSerializer(serializers.ModelSerializer):
     class Meta:
         model = Phone
         fields = '__all__'
 
+## sales manager
 
-from rest_framework import serializers
-from .models import Customer
 
+class PurchaseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Purchase
+        fields = '__all__'
+
+class SoldProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SoldProduct
+        fields = '__all__'
+
+
+    
+class ProductItemSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(min_value=1)
+    quantity = serializers.IntegerField(min_value=1)
+    
+
+    
+    
+
+
+##login 
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        
+        # Add admin claims to the token
+        token['is_staff'] = user.is_staff
+        token['is_superuser'] = user.is_superuser
+        token['username'] = user.username
+        
+        return token
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        
+        # Add user info to the response
+        data['user'] = {
+            'id': self.user.id,
+            'username': self.user.username,
+            'is_staff': self.user.is_staff,
+            'is_superuser': self.user.is_superuser
+        }
+        return data
+    
+### logout 
+
+class LogoutSerializer(serializers.Serializer):
+    refresh = serializers.CharField()
+    access = serializers.CharField()
+
+    def validate(self, attrs):
+        self.refresh_token = attrs['refresh']
+        self.access_token = attrs['access']
+        return attrs
+
+    def save(self, **kwargs):
+        try:
+            # Blacklist refresh token
+            RefreshToken(self.refresh_token).blacklist()
+            
+            # Blacklist access token
+            access_token = AccessToken(self.access_token)
+            jti = access_token['jti']
+            expires_at = access_token['exp']
+            remaining_lifetime = expires_at - int(time.time())
+            
+            if remaining_lifetime > 0:
+                cache.set(
+                    f'access_blacklist_{jti}',
+                    True,
+                    timeout=remaining_lifetime
+                )
+        except TokenError as e:
+            raise serializers.ValidationError({'error': str(e)})
+
+
+
+class SoldProductsLogSerializer(serializers.ModelSerializer):
+    customer_name = serializers.SerializerMethodField()
+    customer_national_num = serializers.CharField(source='customer_id.national_num')
+    branch = serializers.CharField(source='branch_id.location')
+    total_price = serializers.DecimalField(max_digits=10, decimal_places=2)
+    
+    class Meta:
+        model = Purchase
+        fields = [
+            'purchase_id',
+            'date_of_purchase',
+            'total_price',
+            'total_items',
+            'customer_name',
+            'customer_national_num',
+            'branch'
+        ]
+    
+    def get_customer_name(self, obj):
+        return f"{obj.customer_id.first_name} {obj.customer_id.last_name}"
+
+    def get_customer_name(self, obj):
+        return f"{obj.customer_id.first_name} {obj.customer_id.middle_name} {obj.customer_id.last_name}"
+
+    def get_total_products(self, obj):
+        return obj.soldproduct_set.aggregate(total=Sum('quantity'))['total'] or 0
+
+    def get_total_price(self, obj):
+        return obj.soldproduct_set.aggregate(
+            total=Sum(F('selling_price') * F('quantity'))
+        )['total'] or 0
+
+class RequestedProductsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RequestedProducts
+        fields = '__all__'
+
+class ProductTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductTransaction
+        fields = '__all__'
+
+class TransportedProductsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TransportedProducts
+        fields = '__all__'
+        
+    
+
+
+# warehouse MANAGER 
+
+## send products 
+class WarehouseProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = ['product_id', 'product_name', 'category_id', 'quantity', 'main_price', 'sale_price']
+
+
+class ProductItemSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField()
+    quantity = serializers.IntegerField(min_value=1)
+
+class ProductTransferSerializer(serializers.Serializer):
+    product_id = serializers.IntegerField(required=True)
+    quantity = serializers.IntegerField(required=True, min_value=1)
+
+
+
+
+class TransportedProductSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product_id.product_name')
+    category_id = serializers.IntegerField(source='product_id.category_id.pk')
+    category_name = serializers.CharField(source='product_id.category_id.category_name')
+    
+    class Meta:
+        model = TransportedProducts
+        fields = [
+            'product_id',
+            'product_name',
+            'category_id',
+            'category_name',
+            'quantity',
+            'main_price',
+            'selling_price'
+        ]
+
+class TransportedProductSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product_id.product_name')
+    category_id = serializers.IntegerField(source='product_id.category_id.pk')
+    category_name = serializers.CharField(source='product_id.category_id.category_name')
+    
+    class Meta:
+        model = TransportedProducts
+        fields = [
+            'product_id',
+            'product_name',
+            'category_id',
+            'category_name',
+            'quantity',
+            'main_price',
+            'selling_price'
+        ]
+
+
+# # For detail view
+class ProductTransactionDetailSerializer(serializers.ModelSerializer):
+    branch_location = serializers.SerializerMethodField()
+    products = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = ProductTransaction
+        fields = ['process_id', 'date_of_transaction', 'branch_location', 'products']
+    
+    def get_branch_location(self, obj):
+        try:
+            return obj.branch_id.location
+        except:
+            return None
+    
+    def get_products(self, obj):
+        products_data = []
+        for transported_item in obj.transported_items.all():
+            product = transported_item.product
+            try:
+                products_data.append({
+                    'product_id': product.pk,
+                    'product_name': product.product_name,
+                    'category': product.category_id.category_name if product.category_id else None,
+                    'quantity': transported_item.quantity,
+                    'type': 'phone' if hasattr(product, 'phone') else 'accessory' if hasattr(product, 'accessory') else 'unknown'
+                })
+            except Exception as e:
+                continue
+        return products_data
+
+
+
+class RequestedProductLogSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product_id.product_name')
+    category = serializers.CharField(source='product_id.category_id.category_name')
+    status_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RequestedProducts
+        fields = [
+            'id',
+            'product_id',
+            'product_name',
+            'category',
+            'quantity',
+            'status',
+            'status_display',
+            'rejection_reason'
+        ]
+
+    def get_status_display(self, obj):
+        return obj.get_status_display()
+
+class BranchOrderLogSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source='branch_id.location')
+    city = serializers.CharField(source='branch_id.city_id.city_name')
+    manager_name = serializers.SerializerMethodField()
+    products = RequestedProductLogSerializer(
+        source='requestedproducts_set',
+        many=True
+    )
+    status_summary = serializers.SerializerMethodField()
+    total_items = serializers.IntegerField()
+    total_quantity = serializers.IntegerField()
+
+    class Meta:
+        model = BranchOrder
+        fields = [
+            'order_id',
+            'date_of_order',
+            'branch_name',
+            'city',
+            'manager_name',
+            'note',
+            'is_done',
+            'total_items',
+            'total_quantity',
+            'status_summary',
+            'products'
+        ]
+
+    def get_manager_name(self, obj):
+        if obj.branch_id.manager_id:
+            return f"{obj.branch_id.manager_id.f_name} {obj.branch_id.manager_id.l_name}"
+        return None
+
+    def get_status_summary(self, obj):
+        return {
+            'pending': getattr(obj, 'pending', 0),
+            'approved': getattr(obj, 'approved', 0),
+            'rejected': getattr(obj, 'rejected', 0)
+        }
+class ProductActionSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    action = serializers.ChoiceField(choices=['approve', 'reject'])
+    rejection_reason = serializers.CharField(required=False, allow_blank=True)
+
+class ProcessRequestSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=['approve', 'reject', 'partial'])
+    rejection_reason = serializers.CharField(required=False, allow_blank=True)
+    products = ProductActionSerializer(many=True, required=False)
+    
+    
+    
+##request logs 
+
+
+
+class ColorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Color
+        fields = ['color_id', 'color_name']
+        extra_kwargs = {
+            'color_id': {
+                'read_only': True  
+            }
+        }
+class AccessoriesTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AccessoriesType
+        fields = ['accessories_type', 'type']
+        extra_kwargs = {
+            'accessories_type': {
+                'read_only': True  
+            }
+        }
+class BrandSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Brand
+        fields = ['brand_id', 'brand_name']
+        extra_kwargs = {
+            'brand_id': {
+                'read_only': True  
+            }
+        }
+    
+
+
+
+
+class TransportedProductSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.product_name')
+    category_name = serializers.CharField(source='product.category_id.category_name') 
+
+    class Meta:
+        model = TransportedProducts
+        fields = [
+            'product_id',
+            'product_name',
+            'category_name',
+            'quantity',
+            'main_price',
+            'selling_price'
+        ]
+        
+        
+        
+        
+### logging 
+# from .models import ActivityLog
+
+class ActivityLogSerializer(serializers.ModelSerializer):
+    user = serializers.StringRelatedField()
+    
+    class Meta:
+        model = ActivityLog
+        fields = '__all__'
+class RequestedProductsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RequestedProducts
+        fields = ['id', 'product_id', 'quantity', 'status', 'rejection_reason']
+        
+class BranchOrderSerializer(serializers.ModelSerializer):
+    requested_products = RequestedProductsSerializer(many=True, read_only=True, source='requestedproducts_set')
+    
+    class Meta:
+        model = BranchOrder
+        fields = ['order_id', 'branch_id', 'date_of_order', 'note', 'is_done', 'requested_products']
+
+class RequestedProductActionSerializer1(serializers.Serializer):
+    id = serializers.IntegerField()
+    action = serializers.ChoiceField(choices=['approve', 'reject'])
+    quantity = serializers.IntegerField(required=False)
+    rejection_reason = serializers.CharField(required=False)
+
+class ProcessRequestSerializer1(serializers.Serializer):
+    action = serializers.ChoiceField(choices=['approve', 'reject', 'partial'])
+    rejection_reason = serializers.CharField(required=False)
+    products = RequestedProductActionSerializer1(many=True, required=False)
+    
+    def validate(self, data):
+        action = data.get('action')
+        products = data.get('products')
+
+        if action == 'partial':
+            if not products:
+                raise serializers.ValidationError({
+                    'products': 'This field is required for partial action.'
+                })
+            for p in products:
+                if 'id' not in p or 'action' not in p:
+                    raise serializers.ValidationError({
+                        'products': 'Each product must include id and action.'
+                    })
+
+        return data
+    
+    
+### sale manager serializers 
+
+## make sale serializer
+class MakeSaleSerializer(serializers.Serializer):
+    customer_id = serializers.IntegerField()
+    products = serializers.ListField(  
+        child=serializers.DictField(   
+            child=serializers.IntegerField()
+        )
+    )
+    
+### customer 
 class CustomerSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     
@@ -86,41 +526,8 @@ class CustomerSerializer(serializers.ModelSerializer):
     
     def get_full_name(self, obj):
         return f"{obj.first_name} {obj.middle_name} {obj.last_name}"
-
-class PurchaseSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Purchase
-        fields = '__all__'
-
-class SoldProductSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SoldProduct
-        fields = '__all__'
-
-class BranchOrderSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = BranchOrder
-        fields = '__all__'
-
-class RequestedProductsSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = RequestedProducts
-        fields = '__all__'
-
-class ProductTransactionSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ProductTransaction
-        fields = '__all__'
-
-class TransportedProductsSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = TransportedProducts
-        fields = '__all__'
-        
     
-    from rest_framework import serializers
-### make sale 
-
+## search customer serializer 
 class CustomerSearchSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
 
@@ -131,101 +538,8 @@ class CustomerSearchSerializer(serializers.ModelSerializer):
     def get_full_name(self, obj):
         return f"{obj.first_name} {obj.middle_name} {obj.last_name}"
     
-    
-class ProductItemSerializer(serializers.Serializer):
-    product_id = serializers.IntegerField(min_value=1)
-    quantity = serializers.IntegerField(min_value=1)
-    
-class MakeSaleSerializer(serializers.Serializer):
-    customer_id = serializers.IntegerField(required=True, min_value=1)
-    products = serializers.ListField(
-        child=ProductItemSerializer(),
-        min_length=1
-    )
-    
-    
-    
 
-
-
-class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    def validate(self, attrs):
-        data = super().validate(attrs)
-        data.update({
-            'is_staff': self.user.is_staff,
-            'username': self.user.username
-        })
-        return data
-    
-    
-class BranchOrderLogSerializer(serializers.ModelSerializer):
-    branch = serializers.CharField(source='branch_id.location')
-    total_products = serializers.SerializerMethodField()
-    status = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = BranchOrder
-        fields = ['order_id', 'date_of_order', 'branch', 'total_products', 'status']
-    
-    def get_total_products(self, obj):
-        return obj.requestedproducts_set.count()
-    
-    def get_status(self, obj):
-        return "Completed" if obj.is_done else "Pending"
-
-class RequestedProductsDetailSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product_id.product_name')
-    product_category = serializers.CharField(source='product_id.category_id.category_name')
-    status_display = serializers.CharField(source='get_status_display')
-    
-    class Meta:
-        model = RequestedProducts
-        fields = ['product_name', 'product_category', 'quantity', 'status', 'status_display']
-        
-        
-        
-        
-
-class SoldProductsLogSerializer(serializers.ModelSerializer):
-    customer_name = serializers.SerializerMethodField()
-    branch_name = serializers.CharField(source='branch_id.location')
-    branch_city = serializers.CharField(source='branch_id.city_id.city_name')
-    total_products = serializers.SerializerMethodField()
-    total_amount = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Purchase
-        fields = ['purchase_id', 'customer_name', 'branch_name', 'branch_city', 
-                'date_of_purchase', 'total_products', 'total_amount']
-
-    def get_customer_name(self, obj):
-        return f"{obj.customer_id.first_name} {obj.customer_id.middle_name} {obj.customer_id.last_name}"
-
-    def get_total_products(self, obj):
-        return obj.soldproduct_set.aggregate(total=Sum('quantity'))['total'] or 0
-
-    def get_total_amount(self, obj):
-        return obj.soldproduct_set.aggregate(
-            total=Sum(F('selling_price') * F('quantity'))
-        )['total'] or 0
-
-class SoldProductsDetailSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product_id.product_name')
-    product_category = serializers.CharField(source='product_id.category_id.category_name')
-    total_price = serializers.SerializerMethodField()
-
-    class Meta:
-        model = SoldProduct
-        fields = ['product_name', 'product_category', 'quantity', 
-                'selling_price', 'total_price']
-
-    def get_total_price(self, obj):
-        return obj.quantity * obj.selling_price
-    
-    
-    
-    
-    ### add customer sales manager 
+### add customer sales manager 
 
 class AddCustomerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -242,61 +556,48 @@ class AddCustomerSerializer(serializers.ModelSerializer):
             'national_num': {'required': True},
             'phone_num': {'required': True}
         }
-        
-        
-        
-        
-from rest_framework import serializers
-from .models import Customer, Purchase, SoldProduct
 
+## for purchase 
 class CustomerSaleSerializer(serializers.ModelSerializer):
+    date_of_purchase = serializers.DateField(format='%Y-%m-%d')
+    branch_id = serializers.IntegerField(source='branch_id.branch_id')
     total_spent = serializers.SerializerMethodField()
     total_products = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Purchase
         fields = [
-            'purchase_id',
-            'date_of_purchase',
-            'branch_id',
-            'total_spent',
-            'total_products'
+            'purchase_id', 'date_of_purchase', 'branch_id',
+            'total_spent', 'total_products'
         ]
-    
+
     def get_total_spent(self, obj):
         return sum(item.selling_price * item.quantity for item in obj.soldproduct_set.all())
-    
+
     def get_total_products(self, obj):
         return sum(item.quantity for item in obj.soldproduct_set.all())
-
+    
+## for customer sales details 
 class SaleDetailSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product_id.product_name')
     product_category = serializers.CharField(source='product_id.category_id.category_name')
+    total_price = serializers.SerializerMethodField()
+    date_of_purchase = serializers.DateField(
+        source='purchase_id.date_of_purchase', 
+        format='%Y-%m-%d'
+    )
     branch_location = serializers.CharField(source='purchase_id.branch_id.location')
-    
+
     class Meta:
         model = SoldProduct
         fields = [
-            'product_id',
-            'product_name',
-            'product_category',
-            'quantity',
-            'main_price',
-            'selling_price',
-            'branch_location',
-            'purchase_id',
-            'date_of_purchase'
+            'product_id', 'product_name', 'product_category',
+            'quantity', 'main_price', 'selling_price', 'total_price',
+            'branch_location', 'date_of_purchase'
         ]
-    
-    date_of_purchase = serializers.DateTimeField(source='purchase_id.date_of_purchase')
-    
-    
-    
-    
-    
-    
-    from rest_framework import serializers
-from .models import Purchase, SoldProduct
+
+    def get_total_price(self, obj):
+        return obj.quantity * obj.selling_price
 
 class PurchaseLogSerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
@@ -343,48 +644,90 @@ class SoldProductDetailSerializer(serializers.ModelSerializer):
     def get_total_price(self, obj):
         return obj.selling_price * obj.quantity
     
-### branch manager requested products log 
-class RequestedProductsLogSerializer(serializers.ModelSerializer):
-    branch_name = serializers.CharField(source='order_id.branch_id.location')
-    date_of_request = serializers.DateTimeField(source='order_id.date_of_order')
-    status_display = serializers.CharField(source='get_status_display')
+    
+    ### branch manager 
+class CreateBranchOrderSerializer(serializers.ModelSerializer):
+    products = serializers.ListField(
+        child=serializers.DictField(),
+        write_only=True,
+        required=True
+    )
 
     class Meta:
-        model = RequestedProducts
-        fields = [
-            'id',
-            'date_of_request',
-            'branch_name',
-            'product_id',
-            'quantity',
-            'status',
-            'status_display'
-        ]
+        model = BranchOrder
+        fields = ['note', 'products']  
+        extra_kwargs = {
+            'note': {'required': False, 'allow_blank': True}
+        }
 
-class RequestedProductDetailSerializer(serializers.ModelSerializer):
+    def validate_products(self, value):
+        for product in value:
+            if not all(k in product for k in ['product_id', 'quantity']):
+                raise serializers.ValidationError("Each product must contain product_id and quantity")
+            if product['quantity'] <= 0:
+                raise serializers.ValidationError("Quantity must be positive")
+        return value
+    
+class OrderLogSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source='branch_id.location', read_only=True)
+    total_items = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    status_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BranchOrder
+        fields = [
+            'order_id', 
+            'branch_name',
+            'date_of_order',
+            'note',
+            'is_done',
+            'total_items',
+            'total_quantity',
+            'status_summary'
+        ]
+        read_only_fields = fields
+
+    def get_total_items(self, obj):
+        return obj.requestedproducts_set.count()
+
+    def get_total_quantity(self, obj):
+        return obj.requestedproducts_set.aggregate(
+            total=Sum('quantity')
+        )['total'] or 0
+
+    def get_status_summary(self, obj):
+        return obj.requestedproducts_set.aggregate(
+            pending=Count('status', filter=Q(status='P')),
+            approved=Count('status', filter=Q(status='A')),
+            rejected=Count('status', filter=Q(status='R'))
+        )
+
+class OrderDetailSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product_id.product_name')
-    category_name = serializers.CharField(source='product_id.category_id.category_name')
-    branch_name = serializers.CharField(source='order_id.branch_id.location')
-    date_of_request = serializers.DateTimeField(source='order_id.date_of_order')
-    status_display = serializers.CharField(source='get_status_display')
+    category = serializers.CharField(source='product_id.category_id.category_name')
+    status_display = serializers.SerializerMethodField()
 
     class Meta:
         model = RequestedProducts
         fields = [
             'id',
             'product_name',
-            'category_name',
+            'category',
             'quantity',
             'status',
-            'status_display',
-            'branch_name',
-            'date_of_request',
-            'rejection_reason'
+            'status_display'
         ]
-        
-        
-### sold products logs for branch managers 
-class SoldProductsLogSerializer(serializers.ModelSerializer):
+    
+    def get_status_display(self, obj):
+        status_dict = {
+            'P': 'Pending',
+            'A': 'Approved',
+            'R': 'Rejected'
+        }
+        return status_dict.get(obj.status, 'Unknown')
+
+class SoldProductsLogSerializer(serializers.ModelSerializer):###used
     customer_name = serializers.SerializerMethodField()
     total_amount = serializers.SerializerMethodField()
     total_items = serializers.SerializerMethodField()
@@ -406,7 +749,7 @@ class SoldProductsLogSerializer(serializers.ModelSerializer):
             total=Sum('quantity')
         )['total'] or 0
 
-class SoldProductDetailSerializer(serializers.ModelSerializer):
+class SoldProductDetailSerializer(serializers.ModelSerializer):###used
     product_name = serializers.CharField(source='product_id.product_name')
     category_name = serializers.CharField(source='product_id.category_id.category_name')
     total_price = serializers.SerializerMethodField()
@@ -418,32 +761,54 @@ class SoldProductDetailSerializer(serializers.ModelSerializer):
     def get_total_price(self, obj):
         return obj.selling_price * obj.quantity
 
+class SoldProductsDetailSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product_id.product_name')
+    product_category = serializers.CharField(source='product_id.category_id.category_name')
+    total_price = serializers.SerializerMethodField()
 
-
-# warehouse MANAGER 
-
-## send products 
-class WarehouseProductSerializer(serializers.ModelSerializer):
     class Meta:
-        model = Product
-        fields = ['product_id', 'product_name', 'category_id', 'quantity', 'main_price', 'sale_price']
+        model = SoldProduct
+        fields = ['product_name', 'product_category', 'quantity', 
+                'selling_price', 'total_price']
+
+    def get_total_price(self, obj):
+        return obj.quantity * obj.selling_price
 
 
-class ProductItemSerializer(serializers.Serializer):
-    product_id = serializers.IntegerField()
-    quantity = serializers.IntegerField(min_value=1)
-
+### warehouse manager 
 class SendProductsSerializer(serializers.Serializer):
-    branch_name = serializers.CharField(required=True)
+    branch_location = serializers.CharField(required=True)
     products = serializers.ListField(
-        child=ProductItemSerializer(),
-        min_length=1
+        child=serializers.DictField(
+            child=serializers.IntegerField()
+        )
     )
     
-    
-### retrieve from branch 
-from .models import BranchProducts
+    def validate_branch_location(self, value):
+        if not Branch.objects.filter(location__iexact=value).exists():
+            raise serializers.ValidationError("Branch location not found")
+        return value
+        
+    def validate_products(self, value):
+        if len(value) == 0:
+            raise serializers.ValidationError("At least one product must be specified")
+        return value
 
+class RetrieveProductsSerializer(serializers.Serializer):
+    branch_location = serializers.CharField(required=True)
+    products = serializers.ListField(
+        child=serializers.DictField(
+            child=serializers.IntegerField()
+        ),
+        min_length=1
+    )
+
+    def validate_branch_location(self, value):
+        if not Branch.objects.filter(location__iexact=value).exists():
+            raise serializers.ValidationError("Branch location not found")
+        return value
+
+##for retrieving 
 class BranchProductSerializer(serializers.ModelSerializer):
     product_id = serializers.IntegerField(source='product_id.product_id')
     product_name = serializers.CharField(source='product_id.product_name')
@@ -462,177 +827,19 @@ class BranchProductSerializer(serializers.ModelSerializer):
             'quantity'
         ]
 
+class ProductTransactionListSerializer(serializers.ModelSerializer):
+    branch_location = serializers.CharField(source='branch_id.location')  
+    total_products = serializers.IntegerField()
+    total_quantity = serializers.IntegerField()
 
-class RetrieveProductsSerializer(serializers.Serializer):
-    branch_id = serializers.IntegerField(required=True)
-    products = serializers.ListField(
-        child=ProductItemSerializer(),
-        min_length=1
-    )
-    
-    
-    
-### products log serializer 
-# serializers.py
-from rest_framework import serializers
-from .models import ProductTransaction, TransportedProducts
-
-class TransportedProductsSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product_id.product_name')
-    category = serializers.CharField(source='product_id.category_id.category_name')
-    
-    class Meta:
-        model = TransportedProducts
-        fields = [
-            'product_id', 
-            'product_name',
-            'category',
-            'main_price',
-            'selling_price',
-            'quantity',
-            'movement_type'
-        ]
-
-class ProductTransactionSerializer(serializers.ModelSerializer):
-    products = TransportedProductsSerializer(
-        source='transportedproducts_set', 
-        many=True
-    )
-    branch_name = serializers.CharField(source='branch_id.location')
-    movement_type_display = serializers.CharField(source='get_movement_type_display')
-    
     class Meta:
         model = ProductTransaction
         fields = [
             'process_id',
             'date_of_transaction',
-            'branch_name',
+            'branch_location',
             'movement_type',
-            'movement_type_display',
-            'is_done',
-            'products'
+            'total_products',
+            'total_quantity',
+            'is_done'
         ]
-
-
-
-### manage requests 
-# serializers.py
-from rest_framework import serializers
-from .models import BranchOrder, RequestedProducts
-
-class RequestedProductSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product_id.product_name')
-    category = serializers.CharField(source='product_id.category_id.category_name')
-    current_warehouse_stock = serializers.SerializerMethodField()
-
-    class Meta:
-        model = RequestedProducts
-        fields = [
-            'id',
-            'product_id',
-            'product_name',
-            'category',
-            'quantity',
-            'status',
-            'current_warehouse_stock',
-            'rejection_reason'
-        ]
-
-    def get_current_warehouse_stock(self, obj):
-        return obj.product_id.quantity
-
-class BranchOrderSerializer(serializers.ModelSerializer):
-    branch_name = serializers.CharField(source='branch_id.location')
-    requested_products = RequestedProductSerializer(
-        source='requestedproducts_set', 
-        many=True,
-        read_only=True
-    )
-    manager_name = serializers.SerializerMethodField()
-
-    class Meta:
-        model = BranchOrder
-        fields = [
-            'order_id',
-            'branch_name',
-            'manager_name',
-            'date_of_order',
-            'note',
-            'is_done',
-            'requested_products'
-        ]
-
-    def get_manager_name(self, obj):
-        if obj.branch_id.manager_id:
-            return str(obj.branch_id.manager_id)
-        return None
-
-class ProductActionSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    action = serializers.ChoiceField(choices=['approve', 'reject'])
-    rejection_reason = serializers.CharField(required=False, allow_blank=True)
-
-class ProcessRequestSerializer(serializers.Serializer):
-    action = serializers.ChoiceField(choices=['approve', 'reject', 'partial'])
-    rejection_reason = serializers.CharField(required=False, allow_blank=True)
-    products = ProductActionSerializer(many=True, required=False)
-    
-    
-    
-##request logs 
-# serializers.py
-from rest_framework import serializers
-from .models import BranchOrder, RequestedProducts
-
-class RequestedProductLogSerializer(serializers.ModelSerializer):
-    product_name = serializers.CharField(source='product_id.product_name')
-    category = serializers.CharField(source='product_id.category_id.category_name')
-    status_display = serializers.CharField(source='get_status_display')
-
-    class Meta:
-        model = RequestedProducts
-        fields = [
-            'id',
-            'product_id',
-            'product_name',
-            'category',
-            'quantity',
-            'status',
-            'status_display',
-            'rejection_reason'
-        ]
-
-class BranchOrderLogSerializer(serializers.ModelSerializer):
-    branch_name = serializers.CharField(source='branch_id.location')
-    city = serializers.CharField(source='branch_id.city_id.city_name')
-    manager_name = serializers.SerializerMethodField()
-    products = RequestedProductLogSerializer(
-        source='requestedproducts_set', 
-        many=True
-    )
-    status_summary = serializers.SerializerMethodField()
-
-    class Meta:
-        model = BranchOrder
-        fields = [
-            'order_id',
-            'branch_name',
-            'city',
-            'manager_name',
-            'date_of_order',
-            'note',
-            'is_done',
-            'status_summary',
-            'products'
-        ]
-
-    def get_manager_name(self, obj):
-        return str(obj.branch_id.manager_id) if obj.branch_id.manager_id else None
-
-    def get_status_summary(self, obj):
-        products = obj.requestedproducts_set.all()
-        return {
-            'pending': products.filter(status='P').count(),
-            'approved': products.filter(status='S').count(),
-            'rejected': products.filter(status='R').count()
-        }

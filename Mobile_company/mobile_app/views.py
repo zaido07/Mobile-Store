@@ -1,8 +1,28 @@
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from .authentication import *
+from rest_framework import status
+from django.core.exceptions import ValidationError,FieldError,ObjectDoesNotExist
+from rest_framework.generics import GenericAPIView
+from rest_framework.exceptions import ValidationError,APIException
+from decimal import Decimal
+from .models import *
+from .serializers import *
+from .permissions import *
+from rest_framework.filters import OrderingFilter
+from django.db.models import Prefetch
+from django.db import IntegrityError
+from django.db import transaction as db_transaction
 from django.shortcuts import render
 from rest_framework.pagination import PageNumberPagination
+### for pdf 
+from django.template.loader import get_template
+import pdfkit
+from django.http import HttpResponse
+from rest_framework.response import Response
+from django.shortcuts import get_object_or_404
+###
 from rest_framework import generics
 from rest_framework import viewsets
-from .serializers import *
 from rest_framework import permissions
 from  django.http import JsonResponse 
 from django_filters.rest_framework import DjangoFilterBackend
@@ -10,7 +30,6 @@ from .filters import *
 from datetime import datetime
 from rest_framework.views import APIView
 from rest_framework.permissions import BasePermission
-from rest_framework import status
 from django.db.models import Sum, F, FloatField, Q, Count
 from .models import Branch, SoldProduct
 from rest_framework.response import Response# views.py
@@ -24,7 +43,6 @@ from rest_framework.filters import SearchFilter
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.permissions import IsAdminUser,IsAuthenticated
 from django.shortcuts import get_object_or_404
-
 from django.db import transaction
 
 #???????????????????????????????????????????????????????????????????????????????????????
@@ -32,11 +50,6 @@ class CityViewSet(viewsets.ModelViewSet):
     queryset = City.objects.all()
     serializer_class = CitySerializer
     filterset_class = CityFilter
-    # def city_delete(self, request, id):
-    #     if request.method =='DELETE':
-    #         city = City.objects.get(id=id)
-    #         city.delete()
-    #         return JsonResponse("success")
     def get_permissions(self):
         if self.action=="list" or self.action=="retrieve":
             return [permissions.AllowAny()]
@@ -79,21 +92,12 @@ class ProductViewSet(viewsets.ModelViewSet):
         else:
             return super().get_permissions()
 
-class AccessoriesTypeViewSet(viewsets.ModelViewSet):
-    queryset = AccessoriesType.objects.all()
-    serializer_class = AccessoriesTypeSerializer
 
 class AccessoriesViewSet(viewsets.ModelViewSet):
     queryset = Accessories.objects.all()
     serializer_class = AccessoriesSerializer
 
-class BrandViewSet(viewsets.ModelViewSet):
-    queryset = Brand.objects.all()
-    serializer_class = BrandSerializer
 
-class ColorViewSet(viewsets.ModelViewSet):
-    queryset = Color.objects.all()
-    serializer_class = ColorSerializer
 
 class CameraViewSet(viewsets.ModelViewSet):
     queryset = Camera.objects.all()
@@ -121,7 +125,7 @@ class SoldProductViewSet(viewsets.ModelViewSet):
 
 class BranchOrderViewSet(viewsets.ModelViewSet):
     queryset = BranchOrder.objects.all()
-    serializer_class = BranchOrderSerializer
+    serializer_class = BranchOrderLogSerializer
 
 class RequestedProductsViewSet(viewsets.ModelViewSet):
     queryset = RequestedProducts.objects.all()
@@ -135,22 +139,6 @@ class TransportedProductsViewSet(viewsets.ModelViewSet):
     queryset = TransportedProducts.objects.all()
     serializer_class = TransportedProductsSerializer
 
-
-class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    def validate(self, attrs):
-        try:
-            data = super().validate(attrs)
-        except AuthenticationFailed:
-            return {
-                'error': 'Invalid credentials',
-                'detail': 'No active account found with the given credentials'
-            }
-        data.update({
-            'user_id': self.user.id,
-            'username': self.user.username,
-            'is_staff': self.user.is_staff
-        })
-        return data
 
 class LoginView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
@@ -172,131 +160,140 @@ class LoginView(TokenObtainPairView):
             
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
-class LogoutView(TokenBlacklistView):
+class LogoutView(generics.GenericAPIView):
+    serializer_class = LogoutSerializer
+    permission_classes = [IsAuthenticated]
+
     def post(self, request, *args, **kwargs):
         try:
-            return super().post(request, *args, **kwargs)
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                access_token = auth_header.split(' ')[1]
+            else:
+                return Response(
+                    {'error': 'Authorization header missing or invalid'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            
+            data = request.data.copy()
+            data['access'] = access_token
+            
+            serializer = self.serializer_class(data=data)  
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            
+            return Response(
+                {'message': 'Successfully logged out'},
+                status=status.HTTP_200_OK
+            )
         except Exception as e:
-            return Response({
-                'error': 'Logout failed',
-                'detail': str(e)
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-class BranchManagement(APIView):
+####3 Admin 
+### company statistics 
+class AdminStatisticsView(GenericAPIView):
     permission_classes = [IsAdminUser]
-    filter_backends = [DjangoFilterBackend, SearchFilter]
-    filterset_class = BranchFilter  
-    search_fields = ['location']  
+    authentication_classes = [CustomJWTAuthentication]  
+    permission_classes = [IsActiveSuperAdmin]
 
     def get(self, request):
-        queryset = Branch.objects.all()
-        filtered_queryset = self.filter_queryset(queryset)
-        serializer = BranchSerializer(filtered_queryset, many=True)
-        return Response(serializer.data)
-    def get(self, request):
-        branches = Branch.objects.all()
-        serializer = BranchSerializer(branches, many=True)
         
-        return Response(serializer.data)
+        period = request.query_params.get('period', 'all')
+        date_str = request.query_params.get('date', None)
 
-    def post(self, request):
-        serializer = BranchSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-class BranchDetail(APIView):
-    permission_classes = [IsAdminUser]
-
-    # GET /admin/branches/<pk>
-    def get(self, request, pk):
-        try:
-            branch = Branch.objects.get(pk=pk)
-            serializer = BranchSerializer(branch)
-            return Response(serializer.data)
-        except Branch.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-class BranchOperations(APIView):
-    permission_classes = [IsAdminUser]
-
-    # PUT /admin/branches/<pk>/detail
-    def put(self, request, pk):
-        try:
-            branch = Branch.objects.get(pk=pk)
-            serializer = BranchSerializer(branch, data=request.data)
-            if serializer.is_valid():
-                serializer.save()
-                return Response(serializer.data)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        except Branch.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-    # DELETE /admin/branches/<pk>/detail
-    def delete(self, request, pk):
-        try:
-            branch = Branch.objects.get(pk=pk)
-            branch.delete()
-            return Response(status=status.HTTP_204_NO_CONTENT)
-        except Branch.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
         
+        sold_products = SoldProduct.objects.all()
+        customers = Customer.objects.all()
+
         
-###################settings###################################
+        if period != 'all' and date_str:
+            try:
+                if period == 'daily':
+                    try:
+                        filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    except ValueError:
+                    
+                        filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                
+            
+                    start_datetime = datetime.combine(filter_date, datetime.min.time())
+                    end_datetime = datetime.combine(filter_date, datetime.max.time())
+                
+                    date_filter = Q(purchase_id__date_of_purchase__range=(start_datetime, end_datetime))
+                    customer_filter = Q(date_created__date=filter_date)
+                elif period == 'monthly':
+                    filter_date = datetime.strptime(date_str, '%Y-%m').date()
+                    date_filter = (
+                        Q(purchase_id__date_of_purchase__year=filter_date.year) &
+                        Q(purchase_id__date_of_purchase__month=filter_date.month)
+                    )
+                    customer_filter = (
+                        Q(date_created__year=filter_date.year) &
+                        Q(date_created__month=filter_date.month)
+                    )
+                elif period == 'annual':
+                    year = int(date_str)
+                    date_filter = Q(purchase_id__date_of_purchase__year=year)
+                    customer_filter = Q(date_created__year=year)
+                
+                sold_products = sold_products.filter(date_filter)
+                customers = customers.filter(customer_filter)
 
-class CityManagement(APIView):
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "Invalid date format. Use YYYY-MM-DD for daily, YYYY-MM for monthly, YYYY for annual"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        total_sales = sold_products.aggregate(
+            total=Sum(F('selling_price') * F('quantity'), output_field=FloatField()
+        ))['total'] or 0
+
+        total_products_sold = sold_products.aggregate(
+            total=Sum('quantity')
+        )['total'] or 0
+
+        most_sold_product = sold_products.values(
+            'product_id__product_name'
+        ).annotate(
+            total_sold=Sum('quantity')
+        ).order_by('-total_sold').first()
+
+        new_customers_count = customers.aggregate(
+            total=Count('customer_id')
+        )['total'] or 0
+        profits=total_sales-sold_products.aggregate(
+            total=Sum(F('main_price') * F('quantity'), output_field=FloatField()
+        ))['total'] or 0
+        response_data = {
+            "period": period,
+            "filter_date": date_str,
+            "total_sales": round(total_sales, 2),
+            "total_products_sold": total_products_sold,
+            "profits":profits,
+            "most_sold_product": {
+                "name": most_sold_product['product_id__product_name'] if most_sold_product else None,
+                "quantity": most_sold_product['total_sold'] if most_sold_product else 0
+            },
+            
+            "new_customers": new_customers_count
+        }
+
+        return Response(response_data)
+    
+    ####branch statistics 
+    ##############################BranchStatistics####################################
+
+
+
+class BranchStatisticsView(GenericAPIView):
     permission_classes = [IsAdminUser]
-    def get(self,request):
-        city = City.objects.all()
-        serializer = CitySerializer(city, many=True)
-        return Response(serializer.data)
-    # POST /admin/settings/cities/add
-    def post(self, request):
-        serializer = CitySerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    # DELETE /admin/settings/cities/delete/<pk>
-    def delete(self, request, pk):
-        try:
-            city = City.objects.get(pk=pk)
-            city.delete()
-            return Response(status=status.HTTP_204_NO_CONTENT)
-        except City.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-
-class JobManagement(APIView):
-    permission_classes = [IsAdminUser]
-    def get(self,request):
-        job = Job.objects.all() 
-        serializer = JobSerializer(job, many=True)
-        return Response(serializer.data)
-    # POST /admin/settings/jobs/add
-    def post(self, request):
-        serializer = JobSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    # DELETE /admin/settings/jobs/delete/<pk>
-    def delete(self, request, pk):
-        try:
-            job = Job.objects.get(pk=pk)
-            job.delete()
-            return Response(status=status.HTTP_204_NO_CONTENT)
-        except Job.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-        
-##############################BranchStatistics####################################
-
-
-
-class BranchStatisticsView(APIView):
-    permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication]  
+    permission_classes = [IsActiveSuperAdmin]
 
     def get(self, request, pk):
         try:
@@ -304,19 +301,32 @@ class BranchStatisticsView(APIView):
         except Branch.DoesNotExist:
             return Response({"error": "Branch not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Get filter parameters from query params
+    
         period = request.query_params.get('period', 'all')
         date_str = request.query_params.get('date', None)
         
         sold_products = SoldProduct.objects.filter(purchase_id__branch_id=branch)
 
-        # Date filtering logic
         if period != 'all' and date_str:
             try:
                 if period == 'daily':
-                    filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    try:
+                        filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                        
+                    except ValueError:
+                    
+                        filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                
+            
+                    start_datetime = datetime.combine(filter_date, datetime.min.time())
+                    end_datetime = datetime.combine(filter_date, datetime.max.time())
+                
+                    date_filter = Q(purchase_id__date_of_purchase__range=(start_datetime, end_datetime))
+                    customer_filter = Q(date_created__date=filter_date)
                     sold_products = sold_products.filter(
-                        purchase_id__date_of_purchase__date=filter_date
+                        Q(purchase_id__date_of_purchase__year=filter_date.year) &
+                        Q(purchase_id__date_of_purchase__month=filter_date.month)&
+                        Q(purchase_id__date_of_purchase__day=filter_date.day)
                     )
                 elif period == 'monthly':
                     filter_date = datetime.strptime(date_str, '%Y-%m').date()
@@ -335,7 +345,6 @@ class BranchStatisticsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Calculate statistics
         total_sales = sold_products.aggregate(
             total=Sum(F('selling_price') * F('quantity'), output_field=FloatField())
         )['total'] or 0
@@ -365,106 +374,85 @@ class BranchStatisticsView(APIView):
         }
 
         return Response(response_data)
-    
-#################################################################################
-class AdminStatisticsView(APIView):
-    permission_classes = [IsAdminUser]
-
-    def get(self, request):
-        # Get filter parameters
-        period = request.query_params.get('period', 'all')
-        date_str = request.query_params.get('date', None)
-
-        # Initialize base querysets
-        sold_products = SoldProduct.objects.all()
-        customers = Customer.objects.all()
-
-        # Date filtering logic
-        if period != 'all' and date_str:
-            try:
-                if period == 'daily':
-                    filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    date_filter = Q(purchase_id__date_of_purchase__date=filter_date)
-                    customer_filter = Q(date_created__date=filter_date)
-                elif period == 'monthly':
-                    filter_date = datetime.strptime(date_str, '%Y-%m').date()
-                    date_filter = (
-                        Q(purchase_id__date_of_purchase__year=filter_date.year) &
-                        Q(purchase_id__date_of_purchase__month=filter_date.month)
-                    )
-                    customer_filter = (
-                        Q(date_created__year=filter_date.year) &
-                        Q(date_created__month=filter_date.month)
-                    )
-                elif period == 'annual':
-                    year = int(date_str)
-                    date_filter = Q(purchase_id__date_of_purchase__year=year)
-                    customer_filter = Q(date_created__year=year)
-                
-                sold_products = sold_products.filter(date_filter)
-                customers = customers.filter(customer_filter)
-
-            except (ValueError, TypeError):
-                return Response(
-                    {"error": "Invalid date format. Use YYYY-MM-DD for daily, YYYY-MM for monthly, YYYY for annual"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-        # Calculate statistics
-        total_sales = sold_products.aggregate(
-            total=Sum(F('selling_price') * F('quantity'), output_field=FloatField()
-        ))['total'] or 0
-
-        total_products_sold = sold_products.aggregate(
-            total=Sum('quantity')
-        )['total'] or 0
-
-        most_sold_product = sold_products.values(
-            'product_id__product_name'
-        ).annotate(
-            total_sold=Sum('quantity')
-        ).order_by('-total_sold').first()
-
-        new_customers_count = customers.aggregate(
-            total=Count('customer_id')
-        )['total'] or 0
-
-        response_data = {
-            "period": period,
-            "filter_date": date_str,
-            "total_sales": round(total_sales, 2),
-            "total_products_sold": total_products_sold,
-            "most_sold_product": {
-                "name": most_sold_product['product_id__product_name'] if most_sold_product else None,
-                "quantity": most_sold_product['total_sold'] if most_sold_product else 0
-            },
-            "new_customers": new_customers_count
-        }
-
-        return Response(response_data)
-################# Manages Employee ##########################################
-
-
-class EmployeeListView(APIView):
+## branch managements a####################
+class BranchManagement(GenericAPIView):
+    authentication_classes = [CustomJWTAuthentication]  
+    permission_classes = [IsActiveSuperAdmin]
     permission_classes = [IsAdminUser]
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filtersets_class=EmployeeFilter
-    search_fields = ['f_name']
-
+    filterset_class = BranchFilter  
+    search_fields = ['manager_id__f_name']
+    def get_queryset(self):
+        return Branch.objects.select_related('manager_id').all()
+    
     def get(self, request):
-        queryset = Employee.objects.all()
-        
-        
-        filtered_queryset = self.filter_queryset(queryset)
-        
-        serializer = EmployeeSerializer(filtered_queryset, many=True)
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = BranchSerializer(queryset, many=True)
         return Response(serializer.data)
-    def get(self,requset):
-        queryset=Employee.objects.all()
-        serializer=EmployeeSerializer(queryset,many=True)
-        return Response(serializer.data)
-class EmployeeDetailView(APIView):
+
+    def post(self, request):
+        serializer = AddBranchSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class BranchDetail(GenericAPIView):
     permission_classes = [IsAdminUser]
+
+    def get(self, request, pk):
+        try:
+            branch = Branch.objects.get(pk=pk)
+            serializer = BranchSerializer(branch)
+            return Response(serializer.data)
+        except Branch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+class BranchOperations(GenericAPIView):
+    permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication] 
+    permission_classes = [IsActiveSuperAdmin]
+
+    def put(self, request, pk):
+        try:
+            branch = Branch.objects.get(pk=pk)
+            serializer = BranchSerializer(branch, data=request.data,partial=True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Branch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+    
+    def delete(self, request, pk):
+        try:
+            branch = Branch.objects.get(pk=pk)
+            branch.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Branch.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+
+################# Manages Employee ##########################################
+class EmployeeListView(GenericAPIView):
+    permission_classes = [IsAdminUser]
+    queryset = Employee.objects.all()  
+    serializer_class =ManageEmployeeSerializer 
+    filter_backends = [DjangoFilterBackend, SearchFilter,OrderingFilter]
+    filterset_class = EmployeeFilter
+    search_fields = ['f_name']
+    ordering_fields = ['f_name', 'l_name', 'id']  
+    ordering = ['f_name']
+    def get(self, request):
+        queryset = self.filter_queryset(self.get_queryset()) 
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+class EmployeeDetailView(GenericAPIView):
+    permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication]  
+    permission_classes = [IsActiveSuperAdmin]
 
     def get(self, request, pk):
         employee =Employee.objects.get(pk=pk)
@@ -477,7 +465,7 @@ class EmployeeDetailView(APIView):
         employee =Employee.objects.get(pk=pk)
         if not employee:
             return Response({"error": "Employee not found"}, status=status.HTTP_404_NOT_FOUND)
-        serializer = EmployeeSerializer(employee, data=request.data)
+        serializer = EmployeeSerializer(employee, data=request.data,partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data)
@@ -490,18 +478,25 @@ class EmployeeDetailView(APIView):
         employee.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-class AddEmployeeView(APIView):
+class AddEmployeeView(GenericAPIView):
     permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication] 
+    permission_classes = [IsActiveSuperAdmin]
+    
 
     def post(self, request):
-        serializer = EmployeeSerializer(data=request.data)
+        profile_image = models.ImageField(upload_to='employee_images/', null=True, blank=True)
+
+        serializer = EmployeeSerializer(data=request.data,files=request.files)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class CreateEmployeeAccountView(APIView):
+class CreateEmployeeAccountView(GenericAPIView):
     permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication] 
+    permission_classes = [IsActiveSuperAdmin]
 
     def post(self, request, pk):
         try:
@@ -512,69 +507,145 @@ class CreateEmployeeAccountView(APIView):
         required_roles = ['manager', 'hr', 'ceo', 'warehouse manager', 'sales manager']
         if employee.job_id.job_name.lower() not in required_roles:
             return Response({"error": "This job role doesn't require an account"}, 
-                            status=status.HTTP_400_BAD_REQUEST)
+                          status=status.HTTP_400_BAD_REQUEST)
 
         username = request.data.get('username')
-        password = request.data.get('password')
+        password1 = request.data.get('password1')
+        password2 = request.data.get('password2')
         
-        if not username or not password:
-            return Response({"error": "Username and password are required"},
-                            status=status.HTTP_400_BAD_REQUEST)
+        if not username or not password1 or not password2:
+            return Response({"error": "username, password1 and password2 are required"},
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        
+        if password1 != password2:
+            return Response({"error": "Passwords do not match"},
+                          status=status.HTTP_400_BAD_REQUEST)
+
+
+        if len(password1) < 8:
+            return Response({"error": "Password must be at least 8 characters long"},
+                          status=status.HTTP_400_BAD_REQUEST)
 
         if User.objects.filter(username=username).exists():
             return Response({"error": "Username already exists"},
-                            status=status.HTTP_400_BAD_REQUEST)
+                          status=status.HTTP_400_BAD_REQUEST)
 
-        user = User.objects.create_user(
-            username=username,
-            password=password,
-            is_staff=True
-        )
+        try:
+            user = User.objects.create_user(
+                username=username,
+                password=password1,  
+                is_staff=True
+            )
+            
+            employee.user_account = user
+            employee.save()
+
+            return Response({
+                "message": "Account created successfully",
+                "employee_id": employee.id,
+                "username": username
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response({"error": str(e)},
+                          status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
-        employee.user_account = user
-        employee.save()
+###################settings###################################
 
+class CityManagement(GenericAPIView):
+    authentication_classes = [CustomJWTAuthentication] 
+    permission_classes = [IsActiveSuperAdmin]  
+    serializer_class = CitySerializer
+
+    def get(self, request):
+        city = City.objects.all()
+        serializer = self.get_serializer(city, many=True)
+        
+            
         return Response({
-            "message": "Account created successfully",
-            "employee_id": employee.id,
-            "username": username
-        }, status=status.HTTP_201_CREATED)
+            "count": city.count(),
+            "cities": serializer.data,
+            
+            
+        }, status=status.HTTP_200_OK)
+    def post(self, request):
+        
+        serializer = CitySerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        
+        try:
+            city = City.objects.get(pk=pk)
+            city.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except City.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+class JobManagement(GenericAPIView):
+    permission_classes = [IsAdminUser]
+    authentication_classes = [CustomJWTAuthentication] 
+    permission_classes = [IsActiveSuperAdmin]
+    def get(self,request):
+        job = Job.objects.all() 
+        serializer = JobSerializer(job, many=True)
+        return Response({
+            "count": job.count(),
+            "jobs": serializer.data
+        }, status=status.HTTP_200_OK)
+    
+    def post(self, request):
+        serializer = JobSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        try:
+            job = Job.objects.get(pk=pk)
+            job.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Job.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+
+    
+    
+    
+#################################################################################
+
+
         
         
         
         
 #### ceo #####
-class IsCeo(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        else:
-            try:
-                employee=request.user.employee
-                return employee.job_id.job_name.lower()=="ceo"
-            except AttributeError:
-                    return False
-                
 
 ##statistics ####
-class CeoStatisticsView(APIView):
+class CeoStatisticsView(GenericAPIView):
     permission_classes = [IsCeo]
 
     def get(self, request):
-        # Get filter parameters
         period = request.query_params.get('period', 'all')
         date_str = request.query_params.get('date', None)
 
-        # Initialize base querysets
         sold_products = SoldProduct.objects.all()
         customers = Customer.objects.all()
 
-        # Date filtering logic (same as admin statistics)
         if period != 'all' and date_str:
             try:
                 if period == 'daily':
                     filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    date_filter = Q(purchase_id__date_of_purchase__date=filter_date)
+                    date_filter = (
+                        Q(purchase_id__date_of_purchase__year=filter_date.year) &
+                        Q(purchase_id__date_of_purchase__month=filter_date.month)&
+                        Q(purchase_id__date_of_purchase__day=filter_date.day)
+                    )
                     customer_filter = Q(date_created__date=filter_date)
                 elif period == 'monthly':
                     filter_date = datetime.strptime(date_str, '%Y-%m').date()
@@ -600,7 +671,7 @@ class CeoStatisticsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Calculate statistics (same as admin statistics)
+    
         total_sales = sold_products.aggregate(
             total=Sum(F('selling_price') * F('quantity'), output_field=FloatField())
         )['total'] or 0
@@ -634,8 +705,7 @@ class CeoStatisticsView(APIView):
         return Response(response_data)
     
 ## Branch Statistics ##
-# views.py
-class CeoBranchStatisticsView(APIView):
+class CeoBranchStatisticsView(GenericAPIView):
     permission_classes = [IsCeo]
 
     def get(self, request, pk):
@@ -644,14 +714,14 @@ class CeoBranchStatisticsView(APIView):
         except Branch.DoesNotExist:
             return Response({"error": "Branch not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Get filter parameters from query params
+        
         period = request.query_params.get('period', 'all')
         date_str = request.query_params.get('date', None)
         
-        # Base queryset for the specific branch
+
         sold_products = SoldProduct.objects.filter(purchase_id__branch_id=branch)
 
-        # Date filtering logic (same as admin version)
+    
         if period != 'all' and date_str:
             try:
                 if period == 'daily':
@@ -676,7 +746,7 @@ class CeoBranchStatisticsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Calculate statistics
+        
         total_sales = sold_products.aggregate(
             total=Sum(F('selling_price') * F('quantity'), output_field=FloatField())
         )['total'] or 0
@@ -713,12 +783,13 @@ class CeoBranchStatisticsView(APIView):
     
 
 ## branches "" 
-class CeoBranchManagement(APIView):
+class CeoBranchManagement(GenericAPIView):
     permission_classes = [IsCeo]
     filter_backends = [DjangoFilterBackend, SearchFilter]
     filterset_class = BranchFilter  
     search_fields = ['location']  
-
+    def get_queryset(self):
+        return Employee.objects.all()
     def get(self, request):
         queryset = Branch.objects.all()
         
@@ -726,11 +797,6 @@ class CeoBranchManagement(APIView):
         filtered_queryset = self.filter_queryset(queryset)
         
         serializer = BranchSerializer(filtered_queryset, many=True)
-        return Response(serializer.data)
-    def get(self, request):
-        branches = Branch.objects.all()
-        serializer = BranchSerializer(branches, many=True)
-        
         return Response(serializer.data)
 
     def post(self, request):
@@ -740,10 +806,9 @@ class CeoBranchManagement(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class CeoBranchDetail(APIView):
+class CeoBranchDetail(GenericAPIView):
     permission_classes = [IsCeo]
 
-    # GET /admin/branches/<pk>
     def get(self, request, pk):
         try:
             branch = Branch.objects.get(pk=pk)
@@ -752,14 +817,14 @@ class CeoBranchDetail(APIView):
         except Branch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-class CeoBranchOperations(APIView):
+class CeoBranchOperations(GenericAPIView):
     permission_classes = [IsCeo]
 
-    # PUT /admin/branches/<pk>/detail
+    
     def put(self, request, pk):
         try:
             branch = Branch.objects.get(pk=pk)
-            serializer = BranchSerializer(branch, data=request.data)
+            serializer = BranchSerializer(branch, data=request.data,partial=True)
             if serializer.is_valid():
                 serializer.save()
                 return Response(serializer.data)
@@ -767,7 +832,7 @@ class CeoBranchOperations(APIView):
         except Branch.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-    # DELETE /admin/branches/<pk>/detail
+
     def delete(self, request, pk):
         try:
             branch = Branch.objects.get(pk=pk)
@@ -777,13 +842,17 @@ class CeoBranchOperations(APIView):
             return Response(status=status.HTTP_404_NOT_FOUND)
         
 ## setting is add city 
-class CeoCityManagement(APIView):
+class CeoCityManagement(GenericAPIView):
     permission_classes = [IsCeo]
     def get(self,request):
         city = City.objects.all()
         serializer = CitySerializer(city, many=True)
-        return Response(serializer.data)
-    # POST /admin/settings/cities/add
+        return Response({
+            "count": city.count(),
+            "cities": serializer.data,
+            
+            
+        }, status=status.HTTP_200_OK)
     def post(self, request):
         serializer = CitySerializer(data=request.data)
         if serializer.is_valid():
@@ -791,7 +860,7 @@ class CeoCityManagement(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    # DELETE /admin/settings/cities/delete/<pk>
+    
     def delete(self, request, pk):
         try:
             city = City.objects.get(pk=pk)
@@ -802,25 +871,22 @@ class CeoCityManagement(APIView):
 
 
 ## ceo browse employees 
-class CeoEmployeeListView(APIView):
+class CeoEmployeeListView(GenericAPIView):
     permission_classes = [IsCeo]
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filtersets_class=EmployeeFilter
+    filterset_class=EmployeeFilter
     search_fields = ['f_name']
-
+    def get_queryset(self):
+        return Employee.objects.all()
     def get(self, request):
         queryset = Employee.objects.all()
         
         
         filtered_queryset = self.filter_queryset(queryset)
         
-        serializer = EmployeeSerializer(filtered_queryset, many=True)
+        serializer = ManageEmployeeSerializer(filtered_queryset, many=True)
         return Response(serializer.data)
-    def get(self,requset):
-        queryset=Employee.objects.all()
-        serializer=EmployeeSerializer(queryset,many=True)
-        return Response(serializer.data)
-class CeoEmployeeDetailView(APIView):
+class CeoEmployeeDetailView(GenericAPIView):
     permission_classes = [IsCeo]
 
     def get(self, request, pk):
@@ -834,37 +900,24 @@ class CeoEmployeeDetailView(APIView):
 
 ## Hr PAGE###
 
-class IsHr(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        else:
-            try:
-                employee=request.user.employee
-                return employee.job_id.job_name.lower()=="hr"
-            except AttributeError:
-                    return False
+
                 
                 
-class HrEmployeeListView(APIView):
+class HrEmployeeListView(GenericAPIView):
     permission_classes = [IsHr]
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filtersets_class=EmployeeFilter
+    filterset_class=EmployeeFilter
     search_fields = ['f_name']
-
+    def get_queryset(self):
+        return Employee.objects.all()
     def get(self, request):
         queryset = Employee.objects.all()
         
-        
         filtered_queryset = self.filter_queryset(queryset)
         
-        serializer = EmployeeSerializer(filtered_queryset, many=True)
+        serializer = ManageEmployeeSerializer(filtered_queryset, many=True)
         return Response(serializer.data)
-    def get(self,requset):
-        queryset=Employee.objects.all()
-        serializer=EmployeeSerializer(queryset,many=True)
-        return Response(serializer.data)
-class HrEmployeeDetailView(APIView):
+class HrEmployeeDetailView(GenericAPIView):
     permission_classes = [IsHr]
 
     def get(self, request, pk):
@@ -891,7 +944,7 @@ class HrEmployeeDetailView(APIView):
         employee.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-class HrAddEmployeeView(APIView):
+class HrAddEmployeeView(GenericAPIView):
     permission_classes = [IsHr]
 
     def post(self, request):
@@ -901,7 +954,7 @@ class HrAddEmployeeView(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class HrCreateEmployeeAccountView(APIView):
+class HrCreateEmployeeAccountView(GenericAPIView):
     permission_classes = [IsHr]
 
     def post(self, request, pk):
@@ -944,13 +997,15 @@ class HrCreateEmployeeAccountView(APIView):
         
         
 ## hr settings to manage jobs and jobs titles 
-class HrJobManagement(APIView):
+class HrJobManagement(GenericAPIView):
     permission_classes = [IsHr]
     def get(self,request):
         job = Job.objects.all() 
         serializer = JobSerializer(job, many=True)
-        return Response(serializer.data)
-    # POST /admin/settings/jobs/add
+        return Response({
+            "count": job.count(),
+            "jobs": serializer.data
+        }, status=status.HTTP_200_OK)
     def post(self, request):
         serializer = JobSerializer(data=request.data)
         if serializer.is_valid():
@@ -958,7 +1013,6 @@ class HrJobManagement(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    # DELETE /admin/settings/jobs/delete/<pk>
     def delete(self, request, pk):
         try:
             job = Job.objects.get(pk=pk)
@@ -967,443 +1021,80 @@ class HrJobManagement(APIView):
         except Job.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
         
-#### WearHouse Manager Page ###
-class IsWarehouseManager(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        else:
-            try:
-                employee=request.user.employee
-                return employee.job_id.job_name.lower()=="warehouse manager"
-            except AttributeError:
-                return False
-    
-# class WarehouseProductView(APIView):
-#     permission_classes=[IsWarehouseManager]
-#     filter_backends=[DjangoFilterBackend]
-#     filterset_class=ProductFilter
-    
-#     def get(self,request):
-#         queryset = Product.objects.select_related('category_id').prefetch_related('phone_set').all()
-#         filtered_queryset=self.filterset_class(request.GET,queryset=queryset).qs
-#         serializer = ProductSerializer(filtered_queryset, many=True)
-#         return Response(serializer.data)
-# class PhoneManagementView(APIView):
-#     permission_classes=[IsWarehouseManager]
-#     def get_phone(self,pk):
-#         try:
-#             return Phone.objects.get(product_id=pk)
-#         except Phone.DoesNotExist:
-#                 return None
-#     def put(self,request,pk):
-#         phone=self.get_phone(pk)
-#         if not phone:
-#             return Response({"error":"phone not found"},status=status.HTTP_404_NOT_FOUND)
-#         serializer=PhoneSerializer(phone,data=request.data)
-#         if serializer.is_valid():
-#             serializer.save()
-#             return Response(serializer.data)
-#         return Response(serializer.errors,status=status.HTTP_404_NOT_FOUND)
-    
-#     def delete(self,request,pk):
-#         phone=self.get_phone(pk)
-#         if not phone:
-#             return Response({"error":"phone not phound"},status=status.HTTP_404_NOT_FOUND)
-#         phone.delete()
-#         return Response(status=status.HTTP_204_NO_CONTENT)
 
-
-# class AccessoryManagementView(APIView):
-#     permission_classes=[IsWarehouseManager]
-    
-    
-#     def get_accessory(self,requset,pk):
-#         try:
-#             return Accessories.objects.get(product_id=pk)
-#         except Accessories.DoesNotExist():
-#             return None
-    
-#     def put(self,request,pk):
-#         accessory=self.get_accessory(pk)
-#         if not accessory:
-#             return Response({"error":"not found"},status=status.HTTP_404_NOT_FOUND)
-#         serializer=AccessoriesSerializer(accessory,data=request.data)
-#         if serializer.is_valid():
-#             serializer.save()
-#             return Response(serializer.data)
-#         return Response(serializer.errors,status=status.HTTP_400_BAD_REQUEST)
-    
-#     def delete(self,request,pk):
-#         accessory=self.get_accessory(pk)
-#         if not accessory:
-#             return Response({"error":"not found"},status=status.HTTP_404_NOT_FOUND)
-#         accessory.delete()
-#         return Response(status=status.HTTP_204_NO_CONTENT)
-
-# class AddProduct(APIView):
-#     permission_classes=[IsWarehouseManager]
-    
-#     def post(self,request):
-#         serializer=ProductSerializer(data=request.data)
-#         if serializer.is_valid():
-#             product=serializer.save()
-#             if product.category_id.category_name.lower() in ['phone', 'mobile']:
-#                     Phone.objects.create(product_id=product, **request.data.get('phone_specs', {}))
-#             else:
-#                 Accessories.objects.create(product_id=product, **request.data.get('accessory_specs', {}))
-            
-#             return Response(serializer.data, status=status.HTTP_201_CREATED)
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-# class EditMultiple(APIView):
-#     permission_classes=[IsWarehouseManager]
-    
-#     def put(self, request):
-#         updates = request.data.get('updates', [])
-#         if not updates:
-#             return Response({"error": "No updates provided"}, status=400)
-    
-#         updated_ids = []
-#         for item in updates:
-#             product = Product.objects.filter(product_id=item['product_id']).update(
-#                 quantity=item.get('quantity'),
-#                 sale_price=item.get('sale_price')
-#         )
-#             if product:
-#                 updated_ids.append(item['product_id'])
-    
-#         return Response({"updated_products": updated_ids})
-    
-    
-    
-    
-# ### Branch products 
-# class BranchManagerProductsView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-#     filter_backends = [DjangoFilterBackend]
-#     filterset_class = ProductFilter
-
-#     def get(self, request):
-#         # Get the manager's branch
-#         branch = request.user.employee.branch_id
-        
-#         # Get products with quantities in this branch
-#         queryset = Product.objects.filter(
-#             branchproducts__branch_id=branch
-#         ).select_related('category_id').annotate(
-#             branch_quantity=models.F('branchproducts__quantity')
-#         ).distinct()
-
-#         # Apply filters
-#         filtered_queryset = self.filterset_class(request.GET, queryset=queryset).qs
-        
-#         # Custom response format
-#         response_data = [{
-#             'product_id': product.product_id,
-#             'product_name': product.product_name,
-#             'category': product.category_id.category_name,
-#             'main_price': product.main_price,
-#             'sale_price': product.sale_price,
-#             'branch_quantity': product.branch_quantity
-#         } for product in filtered_queryset]
-
-#         return Response(response_data)
-
-
-            
-            
-# ## order product 
-
-# from django.db import transaction
-
-# class BranchOrderView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-
-#     def get(self, request):
-#         """Show available warehouse products"""
-#         warehouse_products = Product.objects.filter(quantity__gt=0).select_related('category_id')
-        
-#         serializer = ProductSerializer(warehouse_products, many=True)
-#         return Response([{
-#             'product_id': p['product_id'],
-#             'product_name': p['product_name'],
-#             'category': p['category_id']['category_name'],
-#             'warehouse_quantity': p['quantity'],
-#             'main_price': p['main_price'],
-#             'sale_price': p['sale_price']
-#         } for p in serializer.data])
-
-#     @transaction.atomic
-#     def post(self, request):
-#         """Create a new product order from warehouse"""
-#         branch = request.user.employee.branch_id
-#         products_data = request.data.get('products', [])
-#         note = request.data.get('note', '')
-
-#         if not products_data:
-#             return Response(
-#                 {"error": "At least one product is required"},
-#                 status=status.HTTP_400_BAD_REQUEST
-#             )
-
-#         # Create the order
-#         order = BranchOrder.objects.create(
-#             branch_id=branch,
-#             note=note,
-#             is_done=False
-#         )
-
-#         results = []
-#         for product_data in products_data:
-#             product_id = product_data.get('product_id')
-#             quantity = product_data.get('quantity')
-
-#             if not product_id or not quantity:
-#                 results.append({
-#                     "product_id": product_id,
-#                     "status": "failed",
-#                     "reason": "Missing product_id or quantity"
-#                 })
-#                 continue
-
-#             try:
-#                 product = Product.objects.get(pk=product_id)
-#                 if product.quantity < quantity:
-#                     results.append({
-#                         "product_id": product_id,
-#                         "status": "failed",
-#                         "reason": "Insufficient warehouse quantity"
-#                     })
-#                     continue
-
-#                 # Create order item
-#                 RequestedProducts.objects.create(
-#                     order_id=order,
-#                     product_id=product,
-#                     quantity=quantity,
-#                     status='P'  # Pending
-#                 )
-
-#                 results.append({
-#                     "product_id": product_id,
-#                     "status": "success",
-#                     "quantity": quantity
-#                 })
-
-#             except Product.DoesNotExist:
-#                 results.append({
-#                     "product_id": product_id,
-#                     "status": "failed",
-#                     "reason": "Product not found"
-#                 })
-
-#         return Response({
-#             "order_id": order.order_id,
-#             "branch_id": branch.branch_id,
-#             "note": note,
-#             "products": results
-#         }, status=status.HTTP_201_CREATED) 
-        
-
-
-
-
-# #### order log 
-# from datetime import datetime
-# from django.db.models import Q
-
-# class BranchOrderHistoryView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-    
-#     def get(self, request):
-#         # Get orders for the manager's branch
-#         branch = request.user.employee.branch_id
-#         orders = BranchOrder.objects.filter(branch_id=branch)
-        
-#         # Ordering
-#         date_order = request.query_params.get('date_order', 'desc').lower()
-#         if date_order == 'asc':
-#             orders = orders.order_by('date_of_order')
-#         else:  # default to desc
-#             orders = orders.order_by('-date_of_order')
-        
-#         # Status filtering
-#         status = request.query_params.get('status', '').lower()
-#         if status == 'completed':
-#             orders = orders.filter(is_done=True)
-#         elif status == 'pending':
-#             orders = orders.filter(is_done=False)
-        
-#         # Date range filtering
-#         start_date = request.query_params.get('start_date')
-#         end_date = request.query_params.get('end_date')
-        
-#         if start_date:
-#             try:
-#                 start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
-#                 orders = orders.filter(date_of_order__gte=start_date)
-#             except ValueError:
-#                 pass
-                
-#         if end_date:
-#             try:
-#                 end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
-#                 orders = orders.filter(date_of_order__lte=end_date)
-#             except ValueError:
-#                 pass
-        
-#         serializer = BranchOrderLogSerializer(orders, many=True)
-#         return Response(serializer.data)
-
-# class BranchOrderDetailView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-    
-#     def get(self, request, order_id):
-#         try:
-#             # Verify the order belongs to the manager's branch
-#             order = BranchOrder.objects.get(
-#                 order_id=order_id,
-#                 branch_id=request.user.employee.branch_id
-#             )
-            
-#             requested_products = RequestedProducts.objects.filter(order_id=order)
-#             serializer = RequestedProductsDetailSerializer(requested_products, many=True)
-            
-#             return Response({
-#                 'order_id': order.order_id,
-#                 'date_of_order': order.date_of_order,
-#                 'branch': order.branch_id.location,
-#                 'note': order.note,
-#                 'status': 'Completed' if order.is_done else 'Pending',
-#                 'products': serializer.data
-#             })
-            
-#         except BranchOrder.DoesNotExist:
-#             return Response(
-#                 {"error": "Order not found or not accessible"},
-#                 status=status.HTTP_404_NOT_FOUND
-#             )
-            
-            
-            
-# ### solds logs 
-# from django.db.models import Sum, F
-
-# class SoldProductsLogView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-
-#     def get(self, request):
-#         # Get the manager's branch
-#         branch = request.user.employee.branch_id
-#         purchases = Purchase.objects.filter(branch_id=branch)
-
-#         # Ordering
-#         date_order = request.query_params.get('date_order', 'desc').lower()
-#         if date_order == 'asc':
-#             purchases = purchases.order_by('date_of_purchase')
-#         else:  # default to desc
-#             purchases = purchases.order_by('-date_of_purchase')
-
-#         # Date range filtering
-#         start_date = request.query_params.get('start_date')
-#         end_date = request.query_params.get('end_date')
-
-#         if start_date:
-#             try:
-#                 start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
-#                 purchases = purchases.filter(date_of_purchase__gte=start_date)
-#             except ValueError:
-#                 pass
-
-#         if end_date:
-#             try:
-#                 end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
-#                 purchases = purchases.filter(date_of_purchase__lte=end_date)
-#             except ValueError:
-#                 pass
-
-#         serializer = SoldProductsLogSerializer(purchases, many=True)
-#         return Response(serializer.data)
-
-# class SoldProductsDetailView(APIView):
-#     permission_classes = [IsAuthenticated, IsManager]
-
-#     def get(self, request, purchase_id):
-#         try:
-#             # Verify the purchase belongs to the manager's branch
-#             purchase = Purchase.objects.get(
-#                 purchase_id=purchase_id,
-#                 branch_id=request.user.employee.branch_id
-#             )
-            
-#             sold_products = SoldProduct.objects.filter(purchase_id=purchase)
-#             serializer = SoldProductsDetailSerializer(sold_products, many=True)
-
-#             # Calculate grand total
-#             grand_total = sum(item['total_price'] for item in serializer.data)
-
-#             return Response({
-#                 'purchase_id': purchase.purchase_id,
-#                 'customer_name': f"{purchase.customer_id.first_name} {purchase.customer_id.middle_name} {purchase.customer_id.last_name}",
-#                 'branch': purchase.branch_id.location,
-#                 'date_of_purchase': purchase.date_of_purchase,
-#                 'products': serializer.data,
-#                 'grand_total': grand_total
-#             })
-
-#         except Purchase.DoesNotExist:
-#             return Response(
-#                 {"error": "Purchase not found or not accessible"},
-#                 status=status.HTTP_404_NOT_FOUND
-#             )
-            
-
-## Sales Manager 
-class IsSaleManager(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False 
-        try:
-            employee=self.user.employee
-            return employee.job_id.job_name.lower()=="sales manager"
-        except AttributeError:
-                    return False
-                
-
-
+#Sales Manager
 ##  branch product 
-
-from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from .models import BranchProducts
-from .serializers import BranchProductSerializer
-
-class SalesManagerProductsView(APIView):
+class SalesManagerProductsView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
-    
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_class = ProductFilter
+    search_fields = ['product_id__product_name']
+
     def get(self, request):
-        """
-        Get all products available in the sales manager's branch
-        Response includes: product_id, name, category, prices, and quantity
-        """
         try:
-            # Get the sales manager's branch
-            branch = request.user.employee.branch_id
+            # Get employee and branch info
+            employee = request.user.employee
+            if not employee or not employee.branch_id:
+                return Response(
+                    {"error": "Branch information not found for this user."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
-            # Get products with quantity > 0 in this branch
+            branch = employee.branch_id
+
             branch_products = BranchProducts.objects.filter(
                 branch_id=branch,
                 quantity__gt=0
             ).select_related(
-                'product_id__category_id'
+                'product_id__category_id',
+                'product_id__phones__brand_id',
+                'product_id__phones__color_id',
+                'product_id__phones__camera_id'
             )
-            
-            serializer = BranchProductSerializer(branch_products, many=True)
-            return Response(serializer.data)
-            
-        except AttributeError:
+
+    
+            product_ids = branch_products.values_list('product_id', flat=True)
+
+
+            filtered_products = self.filterset_class(
+                request.GET,
+                queryset=Product.objects.filter(pk__in=product_ids)
+            ).qs
+
+            filtered_branch_products = branch_products.filter(
+                product_id__in=filtered_products.values_list('pk', flat=True)
+            )
+
+            response_data = []
+            for bp in filtered_branch_products:
+                product = bp.product_id
+                product_data = {
+                    'product_id': product.product_id,
+                    'product_name': product.product_name,
+                    'category': product.category_id.category_name,
+                    'main_price': float(product.main_price),
+                    'sale_price': float(product.sale_price),
+                    'branch_quantity': bp.quantity,
+                }
+
+                if hasattr(product, 'phone'):
+                    phones = product.phone
+                    product_data.update({
+                        'brand': phones.brand_id.brand_name,
+                        'color': phones.color_id.color_name,
+                        'storage': phones.storage,
+                        'battery': phones.battery,
+                        'front_camera': phones.camera_id.front_camera,
+                        'back_camera': phones.camera_id.back_camera,
+                        'ram': phones.ram,
+                        'display_size': float(phones.display_size)
+                    })
+
+                response_data.append(product_data)
+
+            return Response(response_data)
+
+        except AttributeError as e:
             return Response(
                 {"error": "Employee record not found"},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1419,94 +1110,78 @@ class SalesManagerProductsView(APIView):
 ### make sale 
 
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.db import transaction
-from .models import Customer, Product, BranchProducts, Purchase, SoldProduct
-from .serializers import CustomerSearchSerializer, MakeSaleSerializer
 
-class MakeSaleView(APIView):
+class MakeSaleView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
 
     @transaction.atomic
     def post(self, request):
-        """
-        Make a new sale
-        1. Validate customer exists
-        2. Check product availability
-        3. Record sale and update inventory
-        """
         serializer = MakeSaleSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # Get the sales manager's branch
+            
             branch = request.user.employee.branch_id
             
-            # Process customer
-            customer_id = serializer.validated_data['customer_id']
-            try:
-                customer = Customer.objects.get(pk=customer_id)
-            except Customer.DoesNotExist:
-                return Response(
-                    {"error": "Customer not found"}, 
-                    status=status.HTTP_404_NOT_FOUND
-                )
+        
+            customer = get_object_or_404(Customer, pk=serializer.validated_data['customer_id'])
 
-            # Create purchase record
-            purchase = Purchase.objects.create(
-                branch_id=branch,
-                customer_id=customer,
-                date_of_purchase=timezone.now()
-            )
-
-            # Process products
-            sold_products = []
-            grand_total = 0
             
+            products_data = []
             for item in serializer.validated_data['products']:
                 product_id = item['product_id']
                 quantity = item['quantity']
 
-                # Check product availability
                 try:
                     branch_product = BranchProducts.objects.select_for_update().get(
                         branch_id=branch,
                         product_id=product_id,
                         quantity__gte=quantity
                     )
+                    products_data.append({
+                        'branch_product': branch_product,
+                        'product': branch_product.product_id,
+                        'quantity': quantity,
+                        'total_price': branch_product.product_id.sale_price * quantity
+                    })
                 except BranchProducts.DoesNotExist:
                     return Response(
-                        {"error": f"Product ID {product_id} not available in requested quantity"},
+                        {"error": f"Product ID {product_id} only has {branch_product.quantity} available (requested {quantity})"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
+            
+            purchase = Purchase.objects.create(
+                branch_id=branch,
+                customer_id=customer,
+                date_of_purchase=timezone.now()
+            )
 
-                product = branch_product.product_id
-                total_price = product.sale_price * quantity
-                grand_total += total_price
-
-                # Record sold product
+            sold_products = []
+            grand_total = 0
+            
+            for product_info in products_data:
+                
                 SoldProduct.objects.create(
                     purchase_id=purchase,
-                    product_id=product,
-                    quantity=quantity,
-                    main_price=product.main_price,
-                    selling_price=product.sale_price
+                    product_id=product_info['product'],
+                    quantity=product_info['quantity'],
+                    main_price=product_info['product'].main_price,
+                    selling_price=product_info['product'].sale_price
                 )
 
-                # Update inventory
-                branch_product.quantity -= quantity
-                branch_product.save()
+                
+                product_info['branch_product'].quantity -= product_info['quantity']
+                product_info['branch_product'].save()
 
                 sold_products.append({
-                    'product_id': product_id,
-                    'product_name': product.product_name,
-                    'quantity': quantity,
-                    'unit_price': float(product.sale_price),
-                    'total_price': float(total_price)
+                    'product_id': product_info['product'].product_id,
+                    'product_name': product_info['product'].product_name,
+                    'quantity': product_info['quantity'],
+                    'unit_price': float(product_info['product'].sale_price),
+                    'total_price': float(product_info['total_price'])
                 })
+                grand_total += product_info['total_price']
 
             return Response({
                 'success': True,
@@ -1522,19 +1197,44 @@ class MakeSaleView(APIView):
             }, status=status.HTTP_201_CREATED)
 
         except Exception as e:
+        
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
-class CustomerSearchView(APIView):
-    permission_classes = [IsAuthenticated, IsSaleManager]
-
+    
     def get(self, request):
-        """
-        Search customers by name or national number
-        Returns: customer_id, full_name, national_num
-        """
+        full_name = request.query_params.get('full_name')
+        national_num = request.query_params.get('national_num')
+
+        queryset = Customer.objects.all()
+
+        
+        if national_num:
+            queryset = queryset.filter(national_num=national_num)
+
+        
+        elif full_name:
+            parts = full_name.strip().split()
+            if len(parts) == 3:
+                queryset = queryset.filter(
+                    first_name__iexact=parts[0],
+                    middle_name__iexact=parts[1],
+                    last_name__iexact=parts[2]
+                )
+            else:
+                return Response(
+                    {"error": "Full name must include first, middle, and last name."},
+                    status=400
+                )
+
+        serializer = CustomerSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+class CustomerSearchView(GenericAPIView):
+    permission_classes = [IsAuthenticated, IsSaleManager]
+    def get(self, request):
+        
         search_query = request.query_params.get('q', '').strip()
         
         if len(search_query) < 3:
@@ -1548,24 +1248,21 @@ class CustomerSearchView(APIView):
             Q(middle_name__icontains=search_query) |
             Q(last_name__icontains=search_query) |
             Q(national_num__icontains=search_query)
-        )[:10]  # Limit to 10 results
+        )[:10]  
 
         serializer = CustomerSearchSerializer(customers, many=True)
         return Response(serializer.data)
 
 ### add customer 
-class AddCustomerView(APIView):
+class AddCustomerView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def post(self, request):
-        """
-        Add a new customer
-        Required fields: first_name, last_name, national_num, phone_num
-        """
+
         serializer = AddCustomerSerializer(data=request.data)
         if serializer.is_valid():
             try:
-                # Check if customer already exists
+                
                 national_num = serializer.validated_data['national_num']
                 if Customer.objects.filter(national_num=national_num).exists():
                     return Response(
@@ -1573,7 +1270,7 @@ class AddCustomerView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
                 
-                # Create the customer
+                
                 customer = serializer.save()
                 
                 return Response({
@@ -1598,15 +1295,10 @@ class AddCustomerView(APIView):
     
     
     ### customer shows and crud 
-
-
-
-
-class CustomerListView(APIView):
+class CustomerListView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def get(self, request):
-        """Get list of all customers with search capability"""
         search_query = request.query_params.get('search', '').strip()
         
         customers = Customer.objects.all()
@@ -1623,22 +1315,19 @@ class CustomerListView(APIView):
         serializer = CustomerSerializer(customers.order_by('-date_created')[:100], many=True)
         return Response(serializer.data)
 
-class CustomerDetailView(APIView):
+class CustomerDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def get(self, request, pk):
-        """Get single customer details"""
         customer = get_object_or_404(Customer, pk=pk)
         serializer = CustomerSerializer(customer)
         return Response(serializer.data)
     
     def put(self, request, pk):
-        """Update customer details"""
         customer = get_object_or_404(Customer, pk=pk)
         serializer = CustomerSerializer(customer, data=request.data, partial=True)
         
         if serializer.is_valid():
-            # Check national_num uniqueness if being updated
             if 'national_num' in request.data and request.data['national_num'] != customer.national_num:
                 if Customer.objects.filter(national_num=request.data['national_num']).exists():
                     return Response(
@@ -1652,7 +1341,6 @@ class CustomerDetailView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
     def delete(self, request, pk):
-        """Delete a customer"""
         customer = get_object_or_404(Customer, pk=pk)
         customer.delete()
         return Response(
@@ -1663,85 +1351,97 @@ class CustomerDetailView(APIView):
         
 ### customer sales log 
 
-class CustomerSalesLogView(APIView):
+class CustomerSalesView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
+    serializer_class = CustomerSaleSerializer
     
-    def get(self, request, pk):
-        """Get all sales for a specific customer"""
-        customer = get_object_or_404(Customer, pk=pk)
+    def get(self, request, customer_pk, purchase_pk=None):
+        customer = get_object_or_404(Customer, pk=customer_pk)
         
-        # Get all purchases for this customer
+        if purchase_pk:
+            return self._get_sale_detail(customer, purchase_pk)
+        return self._get_customer_sales(customer)
+    
+    def _get_sale_detail(self, customer, purchase_pk):
+        try:
+            purchase = Purchase.objects.get(
+                pk=purchase_pk,
+                customer_id=customer
+            )
+            
+            sold_products = SoldProduct.objects.filter(
+                purchase_id=purchase
+            ).select_related(
+                'product_id__category_id',
+                'purchase_id__branch_id'
+            )
+            
+            serializer = SaleDetailSerializer(sold_products, many=True)
+            
+            purchase_date = purchase.date_of_purchase.strftime('%Y-%m-%d')
+            
+            grand_total = sum(item.selling_price * item.quantity for item in sold_products)
+            total_items = sum(item.quantity for item in sold_products)
+            
+            return Response({
+                'purchase_id': purchase_pk,
+                'customer_id': customer.customer_id,
+                'date': purchase_date, 
+                'branch': purchase.branch_id.location,
+                'products': serializer.data,
+                'grand_total': grand_total,
+                'total_items': total_items
+            })
+            
+        except Purchase.DoesNotExist:
+            return Response(
+                {"error": "Purchase not found for this customer"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    def _get_customer_sales(self, customer):
         purchases = Purchase.objects.filter(
             customer_id=customer
         ).prefetch_related('soldproduct_set').order_by('-date_of_purchase')
         
-        serializer = CustomerSaleSerializer(purchases, many=True)
+        sales_data = []
+        for purchase in purchases:
+            sold_products = purchase.soldproduct_set.all()
+            total_spent = sum(sp.selling_price * sp.quantity for sp in sold_products)
+            total_products = sum(sp.quantity for sp in sold_products)
+            
+            sales_data.append({
+                'purchase_id': purchase.purchase_id,
+                'date_of_purchase': purchase.date_of_purchase.strftime('%Y-%m-%d'),
+                'branch_id': purchase.branch_id.branch_id,
+                'total_spent': total_spent,
+                'total_products': total_products
+            })
         
         return Response({
             'customer_id': customer.customer_id,
             'customer_name': f"{customer.first_name} {customer.last_name}",
             'national_num': customer.national_num,
             'total_purchases': purchases.count(),
-            'sales': serializer.data
+            'sales': sales_data
         })
-
-class SaleDetailView(APIView):
-    permission_classes = [IsAuthenticated, IsSaleManager]
-    
-    def get(self, request, customer_pk, purchase_pk):
-        """Get detailed information about a specific sale"""
-        # Verify customer exists (even though we don't strictly need it for the query)
-        get_object_or_404(Customer, pk=customer_pk)
         
-        # Get all sold products for this purchase
-        sold_products = SoldProduct.objects.filter(
-            purchase_id=purchase_pk
-        ).select_related(
-            'product_id__category_id',
-            'purchase_id__branch_id'
-        )
-        
-        if not sold_products.exists():
-            return Response(
-                {"error": "Purchase not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        serializer = SaleDetailSerializer(sold_products, many=True)
-        
-        # Calculate totals
-        grand_total = sum(item.selling_price * item.quantity for item in sold_products)
-        total_items = sum(item.quantity for item in sold_products)
-        
-        return Response({
-            'purchase_id': purchase_pk,
-            'customer_id': customer_pk,
-            'date': sold_products[0].purchase_id.date_of_purchase,
-            'branch': sold_products[0].purchase_id.branch_id.location,
-            'products': serializer.data,
-            'grand_total': grand_total,
-            'total_items': total_items
-        })
         
 ### sold products log
 
-class SoldProductLogView(APIView):
+class SoldProductLogView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def get(self, request):
-        """Get all purchases with summary information"""
-        # Get the sales manager's branch
+        
         branch = request.user.employee.branch_id
         
-        # Get filter parameters
+        
         search_query = request.query_params.get('search', '')
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
         
-        # Base query - only show purchases from manager's branch
         purchases = Purchase.objects.filter(branch_id=branch)
-        
-        # Apply filters
         if search_query:
             purchases = purchases.filter(
                 Q(purchase_id__icontains=search_query) |
@@ -1755,32 +1455,33 @@ class SoldProductLogView(APIView):
         if date_to:
             purchases = purchases.filter(date_of_purchase__lte=date_to)
         
-        # Order by most recent first
         purchases = purchases.order_by('-date_of_purchase')
+        ordering = self.request.query_params.get('ordering')
+        if ordering:
+            purchases = purchases.order_by(*ordering.split(','))
+        else:
+            purchases = purchases.order_by('-date_of_purchase')
         
         serializer = PurchaseLogSerializer(purchases, many=True)
         return Response(serializer.data)
 
-class PurchaseDetailView(APIView):
+class PurchaseDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def get(self, request, purchase_id):
-        """Get detailed information about a specific purchase"""
-        # Verify purchase exists and belongs to manager's branch
         purchase = get_object_or_404(
             Purchase,
             purchase_id=purchase_id,
             branch_id=request.user.employee.branch_id
         )
         
-        # Get all sold products for this purchase
         sold_products = SoldProduct.objects.filter(
             purchase_id=purchase
         ).select_related('product_id__category_id')
         
         products_serializer = SoldProductDetailSerializer(sold_products, many=True)
         
-        # Calculate totals
+
         grand_total = sum(item.selling_price * item.quantity for item in sold_products)
         total_items = sum(item.quantity for item in sold_products)
         
@@ -1799,34 +1500,25 @@ class PurchaseDetailView(APIView):
         })
 
 ## sales manager bill 
-from django.template.loader import get_template
-import pdfkit
-from django.http import HttpResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.shortcuts import get_object_or_404
-from .models import Purchase, SoldProduct
 
-class GenerateBillView(APIView):
+class GenerateBillView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
+    filter_backends=[DjangoFilterBackend,OrderingFilter]
+    ordering_fields = ['date_of_purchase', 'purchase_id'] 
+    ordering = ['-date_of_purchase']
     
     def get(self, request, purchase_id):
-        """Generate a PDF bill for a purchase"""
         try:
-            # Verify purchase exists and belongs to manager's branch
             purchase = get_object_or_404(
                 Purchase,
                 purchase_id=purchase_id,
                 branch_id=request.user.employee.branch_id
             )
             
-            # Get all sold products for this purchase
             sold_products = SoldProduct.objects.filter(
                 purchase_id=purchase
             ).select_related('product_id__category_id')
             
-            # Prepare data for template
             products_data = []
             grand_total = 0
             
@@ -1862,25 +1554,21 @@ class GenerateBillView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-class GenerateBillPDFView(APIView):
+class GenerateBillPDFView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsSaleManager]
     
     def get(self, request, purchase_id):
-        """Generate a PDF bill for a purchase"""
         try:
-            # Verify purchase exists and belongs to manager's branch
             purchase = get_object_or_404(
                 Purchase,
                 purchase_id=purchase_id,
                 branch_id=request.user.employee.branch_id
             )
             
-            # Get all sold products for this purchase
             sold_products = SoldProduct.objects.filter(
                 purchase_id=purchase
             ).select_related('product_id__category_id')
             
-            # Prepare data for template
             products_data = []
             grand_total = 0
             
@@ -1908,11 +1596,10 @@ class GenerateBillPDFView(APIView):
                 'grand_total': "{:.2f}".format(grand_total)
             }
             
-            # Render template
             template = get_template('bill_template.html')
             html = template.render(context)
             
-            # PDF options
+
             options = {
                 'page-size': 'A5',
                 'margin-top': '0mm',
@@ -1922,14 +1609,14 @@ class GenerateBillPDFView(APIView):
                 'encoding': "UTF-8",
                 'quiet': ''
             }
+            config = pdfkit.configuration(wkhtmltopdf=r'C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe') 
+
+            pdf = pdfkit.from_string(html, False, options=options, configuration=config)
             
-            # Generate PDF
-            pdf = pdfkit.from_string(html, False, options=options)
-            
-            # Create response
             response = HttpResponse(pdf, content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="bill_{purchase_id}.pdf"'
             return response
+            
             
         except Exception as e:
             return Response(
@@ -1940,26 +1627,14 @@ class GenerateBillPDFView(APIView):
             
 ##Branch manager 
 
-## branch manager permisiion 
-class IsManager(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        else:
-            try:
-                employee=request.user.employee
-                return employee.job_id.job_name.lower()=="manager"
-            except AttributeError:
-                    return False
-
 ## branch manager statistics 
 
-class BranchManagerStatisticsView(APIView):
+class BranchManagerStatisticsView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
 
     def get(self, request):
         try:
-            # Get the manager's branch from their employee record
+
             employee = request.user.employee
             branch = employee.branch_id
         except AttributeError:
@@ -1968,21 +1643,26 @@ class BranchManagerStatisticsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Get filter parameters from query params
-        period = request.query_params.get('period', 'all')  # 'daily', 'monthly', 'annual', or 'all'
-        date_str = request.query_params.get('date', None)  # Format depends on period
+        period = request.query_params.get('period', 'all')  
+        date_str = request.query_params.get('date', None)
         
-        # Base queryset for the specific branch
         sold_products = SoldProduct.objects.filter(purchase_id__branch_id=branch)
 
-        # Date filtering logic
         if period != 'all' and date_str:
             try:
                 if period == 'daily':
                     filter_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                     sold_products = sold_products.filter(
-                        purchase_id__date_of_purchase__date=filter_date
+                        Q(purchase_id__date_of_purchase__year=filter_date.year) &
+                        Q(purchase_id__date_of_purchase__month=filter_date.month)&
+                        Q(purchase_id__date_of_purchase__month=filter_date.day)
                     )
+                
+                    start_datetime = datetime.combine(filter_date, datetime.min.time())
+                    end_datetime = datetime.combine(filter_date, datetime.max.time())
+                
+                    date_filter = Q(purchase_id__date_of_purchase__range=(start_datetime, end_datetime))
+                    customer_filter = Q(date_created__date=filter_date)
                 elif period == 'monthly':
                     filter_date = datetime.strptime(date_str, '%Y-%m').date()
                     sold_products = sold_products.filter(
@@ -1999,8 +1679,6 @@ class BranchManagerStatisticsView(APIView):
                     {"error": "Invalid date format. Use YYYY-MM-DD for daily, YYYY-MM for monthly, YYYY for annual"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-        # Calculate statistics
         total_sales = sold_products.aggregate(
             total=Sum(F('selling_price') * F('quantity'))
         )['total'] or 0
@@ -2012,8 +1690,7 @@ class BranchManagerStatisticsView(APIView):
         total_products_sold = sold_products.aggregate(
             total=Sum('quantity')
         )['total'] or 0
-
-        # Get most sold product with details
+        
         most_sold_product = sold_products.values(
             'product_id__product_id',
             'product_id__product_name',
@@ -2043,41 +1720,52 @@ class BranchManagerStatisticsView(APIView):
         return Response(response_data)
     
 ### products 
-class BranchManagerProductsView(APIView):
+class BranchManagerProductsView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
-    filter_backends = [DjangoFilterBackend]
+    filter_backends = [DjangoFilterBackend, SearchFilter]
     filterset_class = ProductFilter
+    search_fields = ['product_id__product_name']
 
     def get(self, request):
-        """
-        Get products available in the manager's branch with filtering options
-        """
         try:
-            # Get the manager's branch
-            branch = request.user.employee.branch_id
+        
+            employee = request.user.employee
+            if not employee or not employee.branch_id:
+                return Response(
+                    {"error": "Branch information not found for this user."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
-            # Get products with quantity > 0 in this branch
+            branch = employee.branch_id
+
+            
             branch_products = BranchProducts.objects.filter(
                 branch_id=branch,
                 quantity__gt=0
             ).select_related(
-                'product_id__category_id'
-            ).prefetch_related(
-                'product_id__phone_set'
+                'product_id__category_id',
+                'product_id__phones__brand_id',
+                'product_id__phones__color_id',
+                'product_id__phones__camera_id'
             )
-            
-            # Apply filters from ProductFilter
+
+            # Get the product IDs first
+            product_ids = branch_products.values_list('product_id', flat=True)
+
+            # Apply filters to the Product queryset
             filtered_products = self.filterset_class(
-                request.GET, 
-                queryset=Product.objects.filter(
-                    pk__in=[bp.product_id.pk for bp in branch_products]
-                )
+                request.GET,
+                queryset=Product.objects.filter(pk__in=product_ids)
             ).qs
-            
-            # Prepare response data with branch quantity
+
+            # Get the filtered branch products
+            filtered_branch_products = branch_products.filter(
+                product_id__in=filtered_products.values_list('pk', flat=True)
+            )
+
             response_data = []
-            for product in filtered_products:
-                bp = branch_products.get(product_id=product)
+            for bp in filtered_branch_products:
+                product = bp.product_id
                 product_data = {
                     'product_id': product.product_id,
                     'product_name': product.product_name,
@@ -2086,27 +1774,26 @@ class BranchManagerProductsView(APIView):
                     'sale_price': float(product.sale_price),
                     'branch_quantity': bp.quantity,
                 }
-                
-                # Add phone specs if product is a mobile
-                if product.category_id.category_name.lower() in ['phone', 'mobile']:
-                    phone = product.phone_set.first()
-                    if phone:
-                        product_data.update({
-                            'brand': phone.brand_id.brand_name,
-                            'color': phone.color_id.color_name,
-                            'storage': phone.storage,
-                            'battery': phone.battery,
-                            'front_camera': phone.camera_id.front_camera,
-                            'back_camera': phone.camera_id.back_camera,
-                            'ram': phone.ram,
-                            'display_size': float(phone.display_size)
-                        })
-                
+
+                # Handle phone-specific data
+                if hasattr(product, 'phone'):
+                    phones = product.phone
+                    product_data.update({
+                        'brand': phones.brand_id.brand_name,
+                        'color': phones.color_id.color_name,
+                        'storage': phones.storage,
+                        'battery': phones.battery,
+                        'front_camera': phones.camera_id.front_camera,
+                        'back_camera': phones.camera_id.back_camera,
+                        'ram': phones.ram,
+                        'display_size': float(phones.display_size)
+                    })
+
                 response_data.append(product_data)
-            
+
             return Response(response_data)
-            
-        except AttributeError:
+
+        except AttributeError as e:
             return Response(
                 {"error": "Employee record not found"},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2116,10 +1803,11 @@ class BranchManagerProductsView(APIView):
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
             
             
             
-class BranchManagerPhoneDetailView(APIView):
+class BranchManagerPhoneDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
 
     def get(self, request, pk):
@@ -2138,7 +1826,7 @@ class BranchManagerPhoneDetailView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-class BranchManagerAccessoryDetailView(APIView):
+class BranchManagerAccessoryDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
 
     def get(self, request, pk):
@@ -2159,213 +1847,287 @@ class BranchManagerAccessoryDetailView(APIView):
             
             
 ### order products 
-class BranchManagerOrderProductsView(APIView):
+class BranchManagerOrderProductsView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
-
-    def get(self, request):
-        """Show available warehouse products with quantity > 0 and search functionality"""
-        search_query = request.query_params.get('search', '').strip()
-        
-        # Base queryset - only products with available quantity
-        warehouse_products = Product.objects.filter(
-            quantity__gt=0
-        ).select_related('category_id').prefetch_related('phone_set')
-        
-        # Apply search filter if provided
-        if search_query:
-            warehouse_products = warehouse_products.filter(
-                Q(product_name__icontains=search_query) |
-                Q(product_id__icontains=search_query) |
-                Q(category_id__category_name__icontains=search_query) |
-                Q(phone_set__brand_id__brand_name__icontains=search_query) |
-                Q(phone_set__color_id__color_name__icontains=search_query)
-            ).distinct()
-        
-        serializer = ProductSerializer(warehouse_products, many=True)
-        
-        # Format response with warehouse quantity
-        response_data = [{
-            'product_id': p['product_id'],
-            'product_name': p['product_name'],
-            'category': p['category_id']['category_name'],
-            'warehouse_quantity': p['quantity'],
-            'main_price': float(p['main_price']),
-            'sale_price': float(p['sale_price']),
-            'specs': self._get_product_specs(p) if p['category_id']['category_name'].lower() in ['phone', 'mobile'] else None
-        } for p in serializer.data]
-        
-        return Response(response_data)
-
-
-    def _get_product_specs(self, product_data):
-        """Helper method to get phone specs if product is a mobile"""
-        if not product_data.get('phone_set'):
-            return None
-            
-        phone = product_data['phone_set'][0]  # Get first phone entry
-        return {
-            'brand': phone['brand_id']['brand_name'],
-            'color': phone['color_id']['color_name'],
-            'storage': phone['storage'],
-            'battery': phone['battery'],
-            'front_camera': phone['camera_id']['front_camera'],
-            'back_camera': phone['camera_id']['back_camera']
-        }
+    serializer_class = CreateBranchOrderSerializer 
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_class = ProductFilter
+    search_fields = ['product_name']
 
     @transaction.atomic
     def post(self, request):
-        """Create a new product order from warehouse"""
+        
         try:
             branch = request.user.employee.branch_id
-            products_data = request.data.get('products', [])
-            note = request.data.get('note', '')
-
-            if not products_data:
-                return Response(
-                    {"error": "At least one product is required"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # Create the order
+            
+            # Validate input with our custom serializer
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
             order = BranchOrder.objects.create(
-                branch_id=branch,
-                note=note,
-                date_of_order=timezone.now(),
-                is_done=False  # Initially not fulfilled
+                branch_id=branch, 
+                note=serializer.validated_data.get('note', ''),
+                date_of_order=timezone.now(), 
+                is_done=False 
             )
 
             results = []
-            for product_data in products_data:
-                product_id = product_data.get('product_id')
-                quantity = product_data.get('quantity')
-
-                if not product_id or not quantity:
-                    results.append({
-                        "product_id": product_id,
-                        "status": "failed",
-                        "reason": "Missing product_id or quantity"
-                    })
-                    continue
+            for product_item in serializer.validated_data['products']:
+                product_id = product_item['product_id']
+                quantity = product_item['quantity']
 
                 try:
                     product = Product.objects.get(pk=product_id)
-                    if product.quantity < quantity:
-                        results.append({
-                            "product_id": product_id,
-                            "status": "failed",
-                            "reason": f"Insufficient warehouse quantity (available: {product.quantity})"
-                        })
-                        continue
-
-                    # Create order item
+                    
                     RequestedProducts.objects.create(
                         order_id=order,
                         product_id=product,
                         quantity=quantity,
-                        status='P'  # Pending
+                        status='P' 
                     )
-
+                    
                     results.append({
                         "product_id": product_id,
                         "status": "success",
                         "quantity": quantity
                     })
-
+                    
                 except Product.DoesNotExist:
                     results.append({
                         "product_id": product_id,
                         "status": "failed",
                         "reason": "Product not found"
                     })
+                except Exception as e:
+                    results.append({
+                        "product_id": product_id,
+                        "status": "failed",
+                        "reason": str(e)
+                    })
 
             return Response({
+                "success": True,
                 "order_id": order.order_id,
                 "branch_id": branch.branch_id,
-                "branch_location": branch.location,
-                "date_of_order": order.date_of_order,
-                "note": note,
-                "products": results
+                "products": results,
+                "note": order.note,
+                "date_ordered": order.date_of_order,
+                "message": "Order created successfully"
             }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({
+                "success": False,
+                "error": str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+    def get(self, request):
+            
+            try:
+                queryset = Product.objects.filter(quantity__gt=0).select_related('category_id')
+                queryset = self.filter_queryset(queryset)
+
+                params = request.query_params
+                category_name = params.get('category')
+                min_price = params.get('min_price')
+                max_price = params.get('max_price')
+
+                if min_price:
+                    queryset = queryset.filter(sale_price__gte=min_price)
+                if max_price:
+                    queryset = queryset.filter(sale_price__lte=max_price)
+
+                if category_name:
+                    queryset = queryset.filter(category_id__category_name__iexact=category_name)
+
+                phone_filters = {}
+                if params.get('brand'):
+                    phone_filters['phones__brand_id__brand_name__iexact'] = params['brand']
+                if params.get('color'):
+                    phone_filters['phones__color_id__color_name__iexact'] = params['color']
+                if params.get('min_storage'):
+                    phone_filters['phones__storage__gte'] = params['min_storage']
+                if params.get('max_storage'):
+                    phone_filters['phones__storage__lte'] = params['max_storage']
+                if params.get('min_ram'):
+                    phone_filters['phones__ram__gte'] = params['min_ram']
+                if params.get('has_sd_card'):
+                    phone_filters['phones__sd_card'] = params['has_sd_card'].lower() == 'true'
+
+                if phone_filters:
+                    queryset = queryset.filter(
+                        Q(category_id__category_name__iexact='phone') | 
+                        Q(category_id__category_name__iexact='mobile'),
+                        **phone_filters
+                    )
+
+                page = self.paginate_queryset(queryset)
+                if page is not None:
+                    serializer = self.get_serializer(page, many=True)
+                    return self.get_paginated_response(serializer.data)
+                
+                products_data = []
+                for product in queryset:
+                    product_data = {
+                        'product_id': product.product_id,
+                        'product_name': product.product_name,
+                        'category': product.category_id.category_name,
+                        'main_price': float(product.main_price),
+                        'sale_price': float(product.sale_price),
+                        'warehouse_quantity': product.quantity
+                    }
+
+                    if product.category_id.category_name.lower() in ['phone', 'mobile']:
+                        try:
+                            phone = Phone.objects.get(product_id=product.product_id)
+                            product_data.update({
+                                'brand': phone.brand_id.brand_name,
+                                'color': phone.color_id.color_name,
+                                'storage': phone.storage,
+                                'ram': phone.ram,
+                                'has_sd_card': phone.sd_card,
+                                'display_size': float(phone.display_size)
+                            })
+                        except Phone.DoesNotExist:
+                            pass
+
+                    products_data.append(product_data)
+
+                return Response(products_data)
+
+            except Exception as e:
+                return Response({
+                    "error": str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+### branch manager requested product logs view 
+
+class OrderLogsView(GenericAPIView):
+    permission_classes = [IsAuthenticated, IsManager]
+    serializer_class = OrderLogSerializer
+    filter_backends=[DjangoFilterBackend,OrderingFilter]
+    filterset_class=BranchOrderFilter
+    pagination_class = PageNumberPagination
+    ordering_fields = ['date_of_order', 'order_id', 'total_quantity']
+    ordering = ['-date_of_order']
+
+    def get_queryset(self):
+        branch = self.request.user.employee.branch_id
+        return BranchOrder.objects.filter(
+        branch_id=branch
+    ).annotate(
+        total_items=Count('requestedproducts_set'),
+        total_quantity=Sum('requestedproducts_set__quantity')
+    ).select_related('branch_id').prefetch_related('requestedproducts_set')
+
+    def get(self, request):
+        try:
+            queryset = self.filter_queryset(self.get_queryset())
+            
+            sort_order = request.query_params.get('sort', 'desc').lower()
+            sort_by = request.query_params.get('sort_by', 'date_of_order')
+            
+            valid_sort_fields = ['date_of_order', 'order_id', 'total_quantity']
+            if sort_by not in valid_sort_fields:
+                return Response(
+                    {"error": f"Invalid sort field. Choose from: {valid_sort_fields}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            if sort_order == 'asc':
+                queryset = queryset.order_by(sort_by)
+            else:
+                queryset = queryset.order_by(f'-{sort_by}')
+
+            # 
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
 
         except Exception as e:
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-            
-            
-### branch manager requested product logs view 
 
-class RequestedProductsLogView(APIView):
+class OrderDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
+    serializer_class = OrderDetailSerializer
 
-    def get(self, request):
-        # Get the manager's branch
-        branch = request.user.employee.branch_id
-        
-        # Get ordering parameter (default to newest first)
-        order_by = request.query_params.get('order_by', '-order_id__date_of_order')
-        
-        # Get requested products with related data
-        requested_products = RequestedProducts.objects.filter(
-            order_id__branch_id=branch
-        ).select_related(
-            'order_id__branch_id',
-            'product_id__category_id'
-        ).order_by(order_by)
-        
-        serializer = RequestedProductsLogSerializer(requested_products, many=True)
-        return Response(serializer.data)
-
-class RequestedProductDetailView(APIView):
-    permission_classes = [IsAuthenticated, IsManager]
-
-    def get(self, request, pk):
-        branch = request.user.employee.branch_id
-        
-        # Verify the requested product belongs to manager's branch
-        requested_product = get_object_or_404(
-            RequestedProducts.objects.select_related(
-                'order_id__branch_id',
+    def get(self, request, order_id):
+        try:
+            branch = request.user.employee.branch_id
+            order = BranchOrder.objects.get(
+                order_id=order_id,
+                branch_id=branch
+            )
+            
+            requested_products = order.requestedproducts_set.select_related(
+                'product_id',
                 'product_id__category_id'
-            ),
-            pk=pk,
-            order_id__branch_id=branch
-        )
-        
-        serializer = RequestedProductDetailSerializer(requested_product)
-        return Response(serializer.data)
-
+            ).all()
+            
+            serializer = self.get_serializer(requested_products, many=True)
+            
+            return Response({
+                "order_id": order.order_id,
+                "branch": order.branch_id.location,
+                "date": order.date_of_order,
+                "note": order.note,
+                "is_done": order.is_done,
+                "products": serializer.data
+            })
+            
+        except ObjectDoesNotExist:
+            return Response(
+                {"error": "Order not found or not accessible"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 ### sold products for branch manager 
-class SoldProductsLogView(APIView):
+class SoldProductsLogView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
+    filter_backends = [SearchFilter]
+    search_fields = ['customer_id__first_name', 'customer_id__last_name', 'customer_id__national_num']
 
     def get(self, request):
-        # Get the manager's branch
         branch = request.user.employee.branch_id
         
-        # Get ordering parameter (default to newest first)
         order_by = request.query_params.get('order_by', '-date_of_purchase')
+        search_query = request.query_params.get('search', None)
         
-        # Get purchases with calculated totals
         purchases = Purchase.objects.filter(
             branch_id=branch
         ).annotate(
-            total_amount=Sum(F('soldproduct__selling_price') * F('soldproduct__quantity')),
+            total_price=Sum(F('soldproduct__selling_price') * F('soldproduct__quantity')),
             total_items=Sum('soldproduct__quantity')
-        ).order_by(order_by)
+        ).select_related('customer_id')
+        
+        if search_query:
+            purchases = purchases.filter(
+                Q(customer_id__first_name__icontains=search_query) |
+                Q(customer_id__last_name__icontains=search_query) |
+                Q(customer_id__national_num__exact=search_query)
+            )
+        
+        purchases = purchases.order_by(order_by.replace('total_amount', 'total_price'))
         
         serializer = SoldProductsLogSerializer(purchases, many=True)
         return Response(serializer.data)
 
-class SoldProductPurchaseDetailView(APIView):
+class SoldProductPurchaseDetailView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsManager]
 
     def get(self, request, purchase_id):
         branch = request.user.employee.branch_id
         
-        # Verify purchase belongs to manager's branch
         purchase = get_object_or_404(
             Purchase,
             branch_id=branch,
@@ -2378,7 +2140,6 @@ class SoldProductPurchaseDetailView(APIView):
         
         serializer = SoldProductDetailSerializer(sold_products, many=True)
         
-        # Add purchase summary
         response_data = {
             "purchase_id": purchase.purchase_id,
             "date_of_purchase": purchase.date_of_purchase,
@@ -2393,41 +2154,47 @@ class SoldProductPurchaseDetailView(APIView):
     
 ### WareHOUSE
 
-### warehouse permission 
-class IsWarehouseManager(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        else:
-            try:
-                employee=request.user.employee
-                return employee.job_id.job_name.lower()=="warehouse manager"
-            except AttributeError:
-                return False
-    
-class WarehouseProductView(APIView):
-    permission_classes=[IsWarehouseManager]
-    filter_backends=[DjangoFilterBackend]
-    filterset_class=ProductFilter
-    
-    def get(self,request):
-        queryset = Product.objects.select_related('category_id').prefetch_related('phone_set').all()
-        filtered_queryset=self.filterset_class(request.GET,queryset=queryset).qs
-        serializer = ProductSerializer(filtered_queryset, many=True)
+
+class WarehouseProductView(GenericAPIView):#used
+    permission_classes = [IsWarehouseManager]
+    serializer_class = ProductSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_class = ProductFilter
+
+    def get_queryset(self):
+        return Product.objects.filter(quantity__gt=0)\
+                             .select_related('category_id')\
+                             .prefetch_related('phone')  
+
+    def get(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
-    
-class PhoneManagementView(APIView):
+class PhoneManagementView(GenericAPIView):#used
     permission_classes=[IsWarehouseManager]
+    serializer_class=PhoneSerializer
     def get_phone(self,pk):
         try:
             return Phone.objects.get(product_id=pk)
         except Phone.DoesNotExist:
                 return None
+
+    def get(self, request,pk):
+        phone =self.get_phone(pk)
+        if not phone:
+            return Response(
+                {"error": "Phone not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        serializer = self.get_serializer(phone)
+        return Response(serializer.data)
+    
+
     def put(self,request,pk):
         phone=self.get_phone(pk)
         if not phone:
             return Response({"error":"phone not found"},status=status.HTTP_404_NOT_FOUND)
-        serializer=PhoneSerializer(phone,data=request.data)
+        serializer=PhoneSerializer(phone,data=request.data,partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data)
@@ -2441,190 +2208,372 @@ class PhoneManagementView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class AccessoryManagementView(APIView):
-    permission_classes=[IsWarehouseManager]
+class AccessoryManagementView(GenericAPIView):#used
+    permission_classes = [IsWarehouseManager]
+    serializer_class = AccessoriesSerializer
     
-    
-    def get_accessory(self,requset,pk):
+    def get_accessory(self, pk):
         try:
             return Accessories.objects.get(product_id=pk)
-        except Accessories.DoesNotExist():
+        except Accessories.DoesNotExist:
             return None
     
-    def put(self,request,pk):
-        accessory=self.get_accessory(pk)
+    def get(self, request, pk):
+        accessory = self.get_accessory(pk)
         if not accessory:
-            return Response({"error":"not found"},status=status.HTTP_404_NOT_FOUND)
-        serializer=AccessoriesSerializer(accessory,data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors,status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Accessory not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = self.get_serializer(accessory)
+        return Response(serializer.data)
     
-    def delete(self,request,pk):
-        accessory=self.get_accessory(pk)
+    def put(self,request,pk):
+            accessory=self.get_accessory(pk)
+            if not accessory:
+                return Response({"error":"accessory not found"},status=status.HTTP_404_NOT_FOUND)
+            serializer=AccessoriesSerializer(accessory,data=request.data,partial=True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors,status=status.HTTP_404_NOT_FOUND)
+    
+    
+    def delete(self, request, pk):
+        accessory = self.get_accessory(pk)
         if not accessory:
-            return Response({"error":"not found"},status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Accessory not found"}, status=status.HTTP_404_NOT_FOUND)
+        
         accessory.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-class AddProduct(APIView):
-    permission_classes=[IsWarehouseManager]
-    
-    def post(self,request):
-        serializer=ProductSerializer(data=request.data)
-        if serializer.is_valid():
-            product=serializer.save()
-            if product.category_id.category_name.lower() in ['phone', 'mobile']:
-                    Phone.objects.create(product_id=product, **request.data.get('phone_specs', {}))
-            else:
-                Accessories.objects.create(product_id=product, **request.data.get('accessory_specs', {}))
-            
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class EditMultiple(APIView):
-    permission_classes=[IsWarehouseManager]
-    
-    def put(self, request):
-        updates = request.data.get('updates', [])
-        if not updates:
-            return Response({"error": "No updates provided"}, status=400)
-    
-        updated_ids = []
-        for item in updates:
-            product = Product.objects.filter(product_id=item['product_id']).update(
-                quantity=item.get('quantity'),
-                sale_price=item.get('sale_price'),
-                main_price=item.get('main_price')
-        )
-            if product:
-                updated_ids.append(item['product_id'])
-    
-        return Response({"updated_products": updated_ids})
-    
-## SEND PRODUCT TO BRANCH 
-from django.db import transaction
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework import status
-
-class WarehouseSendProductsView(APIView):
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    filter_backends = [SearchFilter]
-    search_fields = ['product_name']
-
-    def get(self, request):
-        """List available warehouse products with search"""
-        search_query = request.query_params.get('search', '')
-        
-        products = Product.objects.filter(quantity__gt=0)
-        if search_query:
-            products = products.filter(product_name__icontains=search_query)
-            
-        serializer = WarehouseProductSerializer(
-            products.select_related('category_id').prefetch_related('phone_set'), 
-            many=True
-        )
-        return Response(serializer.data)
+class AddProduct(GenericAPIView):#used
+    permission_classes = [IsWarehouseManager]
+    serializer_class = ProductSerializer
 
     @transaction.atomic
     def post(self, request):
-        """Send products to a branch"""
-        serializer = SendProductsSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        branch_name = serializer.validated_data['branch_name']
-        products_data = serializer.validated_data['products']
-
         try:
-            branch = Branch.objects.get( location__icontains=branch_name.strip())
-        except Branch.DoesNotExist:
-            return Response(
-                {"error": f"Branch '{branch_name}' not found. Available branches: {list(Branch.objects.values_list('location', flat=True))}"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Branch.MultipleObjectsReturned:
-            return Response(
-                {"error": f"Multiple branches match '{branch_name}'. Please be more specific."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            data = request.data.copy()
+            self._validate_base_product_data(data)
 
-        results = []
-        for product_data in products_data:
-            product_id = product_data['product_id']
-            quantity = product_data['quantity']
+            if Product.objects.filter(product_name=data['product_name']).exists():
+                raise ValidationError("Product with this name already exists")
+
+            category = self._get_valid_category(data['category_id'])
+
+            if category.category_name.lower() in ['phone', 'mobile']:
+                phone_data = self._validate_phone_data(data)
+            else:
+                accessory_data = self._validate_accessory_data(data)
+
+            product_serializer = self.get_serializer(data=data)
+            product_serializer.is_valid(raise_exception=True)
+            product = product_serializer.save()
+
+            if category.category_name.lower() in ['phone', 'mobile']:
+                phone_data['product_id'] = product.product_id
+                phone_serializer = PhoneSerializer(data=phone_data)
+                phone_serializer.is_valid(raise_exception=True)
+                phone_serializer.save()
+            else:
+                accessory_data['product_id'] = product.product_id
+                accessory_serializer = AccessoriesSerializer(data=accessory_data)
+                accessory_serializer.is_valid(raise_exception=True)
+                accessory_serializer.save()
+
+            return Response(product_serializer.data, status=status.HTTP_201_CREATED)
+
+        except ValidationError as e:
+            return Response({"error": e.detail if hasattr(e, 'detail') else str(e)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _validate_base_product_data(self, data):
+        required_fields = {
+        'product_name': str,
+        'category_id': int,
+        'main_price': (int, float, Decimal),
+        'sale_price': (int, float, Decimal),
+        'quantity': int
+    }
+
+        errors = {}
+
+        for field, field_type in required_fields.items():
+            if field not in data:
+                errors[field] = "This field is required"
+                continue
 
             try:
-                product = Product.objects.select_for_update().get(pk=product_id)
-                
-                if product.quantity < quantity:
+                if isinstance(field_type, tuple):
+                    data[field] = Decimal(str(data[field]))
+                else:
+                    data[field] = field_type(data[field])
+            except (TypeError, ValueError):
+                errors[field] = f"Invalid value. Expected {field_type if isinstance(field_type, type) else 'numeric'}"
+
+
+            if 'main_price' in data and data['main_price'] <= 0:
+                errors['main_price'] = "Price must be a positive number"
+            if 'sale_price' in data and data['sale_price'] <= 0:
+                errors['sale_price'] = "Price must be a positive number"
+            if 'quantity' in data and data['quantity'] <= 0:
+                errors['quantity'] = "Quantity must be a positive integer"
+
+            if errors:
+                raise ValidationError(errors)
+
+
+    def _get_valid_category(self, category_id):
+        try:
+            category = ProductCategory.objects.get(pk=category_id)
+            if category.category_name.lower() not in ['phone', 'mobile', 'accessory']:
+                raise ValidationError("Invalid category type")
+            return category
+        except ProductCategory.DoesNotExist:
+            raise ValidationError(f"Category with id {category_id} does not exist")
+
+    def _validate_phone_data(self, data):
+        if 'phone_specs' not in data:
+            raise ValidationError("phone_specs are required for phone products")
+
+        phone_data = data['phone_specs'].copy()
+        required_fields = {
+            'brand_id': int,
+            'color_id': int,
+            'camera_id': int,
+            'storage': int,
+            'battery': int,
+            'ram': int,
+            'display_size': float,
+            'color_id':int,
+            'processor':str
+        }
+
+        for field, field_type in required_fields.items():
+            if field not in phone_data:
+                raise ValidationError(f"Missing phone_specs field: {field}")
+            try:
+                phone_data[field] = field_type(phone_data[field])
+            except (TypeError, ValueError):
+                raise ValidationError(f"Invalid phone_specs.{field}. Expected {field_type.__name__}")
+
+        return phone_data
+
+    def _validate_accessory_data(self, data):
+        if 'accessory_specs' not in data:
+            raise ValidationError("accessory_specs are required for accessory products")
+
+        accessory_data = data['accessory_specs'].copy()
+        required_fields = {
+            'description': str,
+            'accessories_type': int
+        }
+
+        for field, field_type in required_fields.items():
+            if field not in accessory_data:
+                raise ValidationError(f"Missing accessory_specs field: {field}")
+            try:
+                accessory_data[field] = field_type(accessory_data[field])
+            except (TypeError, ValueError):
+                raise ValidationError(f"Invalid accessory_specs.{field}. Expected {field_type.__name__}")
+
+        return accessory_data
+
+class EditMultiple(GenericAPIView):#used
+    permission_classes=[IsWarehouseManager]
+    
+    def put(self, request):
+        try:
+            updates = request.data.get('updates', [])
+            if not updates:
+                return Response({"error": "No updates provided"}, status=400)
+        
+            updated_ids = []
+            for item in updates:
+                try:
+                    product = Product.objects.get(product_id=item['product_id'])
+                    if 'quantity' in item:
+                        item['quantity'] = product.quantity + int(item['quantity'])
+                        
+                    update_data = {}
+                    if 'quantity' in item:
+                        update_data['quantity'] = item['quantity']
+                    if 'sale_price' in item:
+                        update_data['sale_price'] = item['sale_price']
+                    if 'main_price' in item:
+                        update_data['main_price'] = item['main_price']
+                    
+                    rows_updated = Product.objects.filter(
+                        product_id=item['product_id']
+                    ).update(**update_data)
+                    
+                    if rows_updated > 0:
+                        updated_ids.append(item['product_id'])
+                        
+                except Product.DoesNotExist:
+                    continue
+                except Exception as e:
+                    print(f"Error updating product {item['product_id']}: {str(e)}")
+                    continue
+            
+            return Response({
+                "updated_products": updated_ids,
+                "message": f"Successfully updated {len(updated_ids)} products"
+            })
+            
+        except Exception as e:
+            return Response({
+                "error": str(e),
+                "details": "Server error during bulk update"
+            }, status=500)
+## SEND PRODUCT TO BRANCH 
+
+
+
+class WarehouseSendProductsView(GenericAPIView):##used
+    permission_classes = [IsAuthenticated, IsWarehouseManager]
+    serializer_class = SendProductsSerializer
+    def get(self, request):
+        products = Product.objects.filter(quantity__gt=0).select_related('category_id')
+        
+        data = []
+        for product in products:
+            data.append({
+                "product_id": product.product_id,
+                "product_name": product.product_name,
+                "quantity": product.quantity,
+                "category": product.category_id.category_name if product.category_id else None,
+                "main_price": product.main_price,
+                "sale_price": product.sale_price,
+            })
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            branch_location = serializer.validated_data['branch_location']
+            try:
+                branch = Branch.objects.get(location__iexact=branch_location)
+            except Branch.DoesNotExist:
+                available_branches = Branch.objects.values_list('location', flat=True)
+                raise ValueError(
+                    f"Branch with location '{branch_location}' not found. "
+                    f"Available branches: {list(available_branches)}"
+                )
+
+            product_transaction = ProductTransaction.objects.create(
+                movement_type='sent',
+                branch_id=branch,
+                is_done=True,
+                date_of_transaction=timezone.now()
+            )
+
+            results = []
+            for item in serializer.validated_data['products']:
+                try:
+                    with transaction.atomic():
+                        product_id = item['product_id']
+                        product = Product.objects.select_for_update().get(pk=product_id)
+                        
+                        if product.quantity < item['quantity']:
+                            raise ValueError(
+                                f"Insufficient stock for product {product.product_id} ({product.product_name}). "
+                                f"Available: {product.quantity}, Requested: {item['quantity']}"
+                            )
+
+                        product.quantity -= item['quantity']
+                        product.save()
+
+                        branch_product, created = BranchProducts.objects.get_or_create(
+                            branch_id=branch,
+                            product_id=product.pk,
+                            defaults={'quantity': item['quantity']}
+                        )
+                        if not created:
+                            branch_product.quantity += item['quantity']
+                            branch_product.save()
+
+                        TransportedProducts.objects.create(
+                            transaction_id=product_transaction.pk,
+                            product_id=product.pk,
+                            main_price=product.main_price,
+                            selling_price=product.sale_price,
+                            quantity=item['quantity']
+                        )
+
+                        results.append({
+                            "product_id": product.pk,
+                            "product_name": product.product_name,
+                            "status": "success",
+                            "quantity_transferred": item['quantity'],
+                            "remaining_warehouse_stock": product.quantity
+                        })
+
+                except Product.DoesNotExist:
                     results.append({
                         "product_id": product_id,
                         "status": "failed",
-                        "reason": f"Insufficient stock (available: {product.quantity})"
+                        "error": f"Product with ID {product_id} not found"
                     })
-                    continue
+                    product_transaction.is_done = False
+                    product_transaction.save()
+                except Exception as e:
+                    results.append({
+                        "product_id": product_id,
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    product_transaction.is_done = False
+                    product_transaction.save()
 
-                # Update warehouse stock
-                product.quantity -= quantity
-                product.save()
+            return Response({
+                "transaction_id": product_transaction.pk,
+                "branch_id": branch.branch_id,
+                "branch_location": branch.location,
+                "branch_number": branch.branch_number,
+                "transaction_date": product_transaction.date_of_transaction,
+                "status": "completed" if product_transaction.is_done else "partial",
+                "results": results
+            }, status=status.HTTP_201_CREATED)
 
-                # Update branch stock (create or update)
-                branch_product, created = BranchProducts.objects.get_or_create(
-                    branch_id=branch,
-                    product_id=product,
-                    defaults={'quantity': quantity}
-                )
-                if not created:
-                    branch_product.quantity += quantity
-                    branch_product.save()
-
-                results.append({
-                    "product_id": product_id,
-                    "status": "success",
-                    "quantity_sent": quantity,
-                    "new_warehouse_stock": product.quantity,
-                    "new_branch_stock": branch_product.quantity
-                })
-
-            except Product.DoesNotExist:
-                results.append({
-                    "product_id": product_id,
-                    "status": "failed",
-                    "reason": "Product not found"
-                })
-
-        return Response({
-            "branch_id": branch.branch_id,
-            "branch_name": branch.location,
-            "products": results
-        }, status=status.HTTP_201_CREATED)
-        
+        except ValueError as e:
+            return Response
 ## retrieve from branch 
-from django.db import transaction
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework import status
-
-class WarehouseRetrieveProductsView(APIView):
+class WarehouseRetrieveProductsView(GenericAPIView):##used
     permission_classes = [IsAuthenticated, IsWarehouseManager]
     filter_backends = [SearchFilter]
     search_fields = ['product_id__product_name']
+    serializer_class = RetrieveProductsSerializer
 
     def get(self, request):
-        """List products in a specific branch with search"""
-        branch_id = request.query_params.get('branch_id')
+        branch_location = request.query_params.get('branch_location')
         search_query = request.query_params.get('search', '')
         
-        if not branch_id:
+        if not branch_location:
             return Response(
-                {"error": "branch_id parameter is required"},
+                {"error": "branch_location parameter is required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        products = BranchProducts.objects.filter(branch_id=branch_id)
+        try:
+            branch = Branch.objects.get(location__iexact=branch_location)
+        except Branch.DoesNotExist:
+            available_branches = Branch.objects.values_list('location', flat=True)
+            return Response(
+                {
+                    "error": f"Branch with location '{branch_location}' not found",
+                    "available_branches": list(available_branches)
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        products = BranchProducts.objects.filter(branch_id=branch)
         
         if search_query:
             products = products.filter(
@@ -2639,21 +2588,31 @@ class WarehouseRetrieveProductsView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        """Retrieve products from branch back to warehouse"""
         serializer = RetrieveProductsSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        branch_id = serializer.validated_data['branch_id']
+        branch_location = serializer.validated_data['branch_location']
         products_data = serializer.validated_data['products']
 
         try:
-            branch = Branch.objects.get(pk=branch_id)
+            branch = Branch.objects.get(location__iexact=branch_location)
         except Branch.DoesNotExist:
+            available_branches = Branch.objects.values_list('location', flat=True)
             return Response(
-                {"error": "Branch not found"}, 
+                {
+                    "error": f"Branch with location '{branch_location}' not found",
+                    "available_branches": list(available_branches)
+                },
                 status=status.HTTP_404_NOT_FOUND
             )
+
+        retrieval_transaction = ProductTransaction.objects.create(
+            movement_type='retrieved',
+            branch_id=branch,
+            is_done=True,
+            date_of_transaction=timezone.now()
+        )
 
         results = []
         for product_data in products_data:
@@ -2661,102 +2620,121 @@ class WarehouseRetrieveProductsView(APIView):
             quantity = product_data['quantity']
 
             try:
-                # Get branch product with lock
-                branch_product = BranchProducts.objects.select_for_update().get(
-                    branch_id=branch,
-                    product_id=product_id
-                )
-                
-                if branch_product.quantity < quantity:
+                with transaction.atomic():
+                    branch_product = BranchProducts.objects.select_for_update().get(
+                        branch_id=branch,
+                        product_id=product_id
+                    )
+                    
+                    if branch_product.quantity < quantity:
+                        results.append({
+                            "product_id": product_id,
+                            "status": "failed",
+                            "reason": f"Insufficient branch stock (available: {branch_product.quantity}, requested: {quantity})"
+                        })
+                        continue
+
+                    product = Product.objects.get(pk=product_id)
+                    
+                    branch_product.quantity -= quantity
+                    branch_product.save()
+                    
+                    product.quantity += quantity
+                    product.save()
+
+                    TransportedProducts.objects.create(
+                        transaction_id=retrieval_transaction.pk,
+                        product_id=product.pk,
+                        main_price=product.main_price,
+                        selling_price=product.sale_price,
+                        quantity=quantity
+                    )
+
                     results.append({
                         "product_id": product_id,
-                        "status": "failed",
-                        "reason": f"Insufficient branch stock (available: {branch_product.quantity})"
+                        "product_name": product.product_name,
+                        "status": "success",
+                        "quantity_retrieved": quantity,
+                        "new_branch_stock": branch_product.quantity,
+                        "new_warehouse_stock": product.quantity
                     })
-                    continue
 
-                # Get or create warehouse product
-                product = Product.objects.get(pk=product_id)
-                
-                # Update quantities
-                branch_product.quantity -= quantity
-                branch_product.save()
-                
-                product.quantity += quantity
-                product.save()
-
-                results.append({
-                    "product_id": product_id,
-                    "status": "success",
-                    "quantity_retrieved": quantity,
-                    "new_branch_stock": branch_product.quantity,
-                    "new_warehouse_stock": product.quantity
-                })
-
-            except (BranchProducts.DoesNotExist, Product.DoesNotExist):
+            except BranchProducts.DoesNotExist:
                 results.append({
                     "product_id": product_id,
                     "status": "failed",
-                    "reason": "Product not found in branch/warehouse"
+                    "reason": f"Product not found in branch '{branch.location}'"
                 })
+            except Product.DoesNotExist:
+                results.append({
+                    "product_id": product_id,
+                    "status": "failed",
+                    "reason": "Product not found in warehouse"
+                })
+            except Exception as e:
+                results.append({
+                    "product_id": product_id,
+                    "status": "failed",
+                    "reason": str(e)
+                })
+                retrieval_transaction.is_done = False
+                retrieval_transaction.save()
 
         return Response({
+            "transaction_id": retrieval_transaction.pk,
             "branch_id": branch.branch_id,
-            "branch_name": branch.location,
-            "products": results
+            "branch_number": branch.branch_number,
+            "branch_location": branch.location,
+            "transaction_date": retrieval_transaction.date_of_transaction.strftime('%Y-%m-%d %H:%M:%S'),
+            "status": "completed" if retrieval_transaction.is_done else "partial",
+            "results": results
         }, status=status.HTTP_200_OK)
     
-### products log movement 
 
-class WarehouseManagerProductsLog(generics.ListAPIView):
+##manage requests 
+class WarehouseManagerRequests(GenericAPIView):##used
     permission_classes = [IsAuthenticated, IsWarehouseManager]
-    serializer_class = ProductTransactionSerializer
-    filter_backends = [DjangoFilterBackend]
-    filterset_class = ProductTransactionFilter
-    
+    permission_classes = [IsAuthenticated, IsWarehouseManager]
+    serializer_class = BranchOrderSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_class = BranchOrderRequestsFilter
+    pagination_class = PageNumberPagination
+    search_fields = ['requestedproducts_set__product_id__product_name']
     def get_queryset(self):
-        # Get all transactions with related data
-        return ProductTransaction.objects.select_related(
-            'branch_id'
-        ).prefetch_related(
-            'transportedproducts_set__product_id__category_id'
-        ).order_by('-date_of_transaction')
+        return BranchOrder.objects.filter(is_done=False)\
+            .select_related('branch_id')\
+            .prefetch_related(
+                Prefetch(
+                    'requestedproducts_set',
+                    queryset=RequestedProducts.objects.select_related(
+                        'product_id',
+                        'product_id__category_id'
+                    )
+                )
+            ).order_by('-date_of_order')
 
-class WarehouseManagerProductLogDetail(generics.RetrieveAPIView):
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    serializer_class = ProductTransactionSerializer
-    queryset = ProductTransaction.objects.all()
-    lookup_field = 'process_id'
-
-### manage requests from the branches 
-class WarehouseManagerRequests(APIView):
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    
     def get(self, request):
-        """
-        Get all pending branch requests with detailed product information
-        """
-        orders = BranchOrder.objects.filter(
-            is_done=False
-        ).select_related(
-            'branch_id',
-            'branch_id__manager_id'
-        ).prefetch_related(
-            'requestedproducts_set__product_id__category_id',
-            'requestedproducts_set__product_id'
-        ).order_by('date_of_order')
-
-        serializer = BranchOrderSerializer(orders, many=True)
-        return Response({
-            'count': orders.count(),
-            'requests': serializer.data
-        })
+        try:
+            queryset = self.filter_queryset(self.get_queryset())
+            
+            # Paginate the queryset
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            
+            # If no pagination, return all results
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+            
+        except Exception as e:
+            return Response(
+                {"error": str(e), "detail": "Error fetching requests"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @transaction.atomic
     def post(self, request, order_id=None):
-        """
-        Process a branch request (approve/reject/partial)
-        """
         try:
             order = BranchOrder.objects.select_for_update().get(
                 order_id=order_id,
@@ -2768,7 +2746,7 @@ class WarehouseManagerRequests(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = ProcessRequestSerializer(data=request.data)
+        serializer = ProcessRequestSerializer1(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2788,11 +2766,13 @@ class WarehouseManagerRequests(APIView):
             )
 
     def _approve_full_order(self, order):
+
+
+
         requested_products = order.requestedproducts_set.select_related(
             'product_id'
         ).select_for_update()
 
-        # Validate stock first
         for rp in requested_products:
             if rp.product_id.quantity < rp.quantity:
                 return Response(
@@ -2806,10 +2786,10 @@ class WarehouseManagerRequests(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # Process all products
         for rp in requested_products:
             self._transfer_product(rp, rp.quantity)
             rp.status = 'S'
+            rp.processed_date = timezone.now()
             rp.save()
 
         order.is_done = True
@@ -2818,7 +2798,7 @@ class WarehouseManagerRequests(APIView):
         return Response({
             "status": "approved",
             "order_id": order.order_id,
-            "transferred_products": RequestedProductSerializer(
+            "transferred_products": RequestedProductsSerializer(
                 requested_products,
                 many=True
             ).data
@@ -2830,6 +2810,7 @@ class WarehouseManagerRequests(APIView):
         for rp in requested_products:
             rp.status = 'R'
             rp.rejection_reason = rejection_reason
+            rp.processed_date = timezone.now()
             rp.save()
 
         order.is_done = True
@@ -2869,6 +2850,7 @@ class WarehouseManagerRequests(APIView):
                         
                     self._transfer_product(rp, quantity)
                     rp.status = 'S'
+                    rp.processed_date = timezone.now()
                     results['approved'].append({
                         "product_id": rp.product_id.product_id,
                         "quantity": quantity
@@ -2876,6 +2858,7 @@ class WarehouseManagerRequests(APIView):
                 
                 elif product_action['action'] == 'reject':
                     rp.status = 'R'
+                    rp.processed_date = timezone.now()
                     rp.rejection_reason = product_action.get('rejection_reason', '')
                     results['rejected'].append({
                         "product_id": rp.product_id.product_id,
@@ -2900,108 +2883,217 @@ class WarehouseManagerRequests(APIView):
         })
 
     def _transfer_product(self, requested_product, quantity):
-        """Atomic transfer of products from warehouse to branch"""
-        # Deduct from warehouse
         Product.objects.filter(
             pk=requested_product.product_id.pk
         ).update(quantity=F('quantity') - quantity)
-        
-        # Add to branch
-        BranchProducts.objects.update_or_create(
-            branch_id=requested_product.order_id.branch_id,
-            product_id=requested_product.product_id,
-            defaults={'quantity': F('quantity') + quantity}
-        )
-        
-        
-### Warehouse requests logs 
-# views.py
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from django_filters.rest_framework import DjangoFilterBackend
-from .models import BranchOrder
-from .serializers import BranchOrderLogSerializer
-from .filters import BranchOrderFilter
-from django.shortcuts import get_object_or_404
 
-class WarehouseManagerRequestLogs(APIView):
+        branch = requested_product.order_id.branch_id
+
+        branch_product, created = BranchProducts.objects.get_or_create(
+            branch_id=branch,
+            product_id=requested_product.product_id,
+            defaults={'quantity': quantity}
+        )
+
+        if not created:
+            branch_product.quantity += quantity
+            branch_product.save()
+
+
+class ColorViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsWarehouseManager]
+    queryset = Color.objects.all()
+    serializer_class = ColorSerializer
+
+    def create(self, request, *args, **kwargs):
+        # Ensure color_id is not in the request data
+        request.data.pop('color_id', None)
+        return super().create(request, *args, **kwargs)
+class BrandViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsWarehouseManager]
+    queryset = Brand.objects.all()
+    serializer_class = BrandSerializer
+    def create(self, request, *args, **kwargs):
+            # Ensure color_id is not in the request data
+        request.data.pop('color_id', None)
+        return super().create(request, *args, **kwargs)
+
+
+class AccessoriesTypeViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsWarehouseManager]
+    queryset = AccessoriesType.objects.all()
+    serializer_class = AccessoriesTypeSerializer
+    def create(self, request, *args, **kwargs):
+            # Ensure color_id is not in the request data
+        request.data.pop('color_id', None)
+        return super().create(request, *args, **kwargs)
+
+class ProductTransactionListView(GenericAPIView):#used
     permission_classes = [IsAuthenticated, IsWarehouseManager]
-    filter_backends = [DjangoFilterBackend]
-    filterset_class = BranchOrderFilter
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_class = ProductTransactionFilter
+    search_fields = ['branch_id__location']
     pagination_class = PageNumberPagination
 
     def get(self, request):
-        queryset = BranchOrder.objects.select_related(
-            'branch_id__city_id',
-            'branch_id__manager_id'
-        ).prefetch_related(
-            'requestedproducts_set__product_id__category_id'
-        ).order_by('-date_of_order')
-
-        # Apply filters
-        filtered_queryset = self.filterset_class(request.GET, queryset=queryset).qs
-
-        # Pagination
-        page = self.pagination_class()
-        page_queryset = page.paginate_queryset(filtered_queryset, request)
-        
-        serializer = BranchOrderLogSerializer(page_queryset, many=True)
-        return page.get_paginated_response(serializer.data)
-
-class WarehouseManagerRequestLogDetail(APIView):
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-
-    def get(self, request, order_id):
-        order = get_object_or_404(
-            BranchOrder.objects.select_related(
-                'branch_id__city_id',
-                'branch_id__manager_id'
+        try:
+            transactions = ProductTransaction.objects.select_related(
+                'branch_id'
             ).prefetch_related(
-                'requestedproducts_set__product_id__category_id'
-            ),
-            order_id=order_id
-        )
-        serializer = BranchOrderLogSerializer(order)
-        return Response(serializer.data)
-##settings
-# Phone Brand Views
-class PhoneBrandListCreateView(generics.ListCreateAPIView):
-    queryset = Brand.objects.all()
-    serializer_class = BrandSerializer
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    filterset_fields = ['is_active']
-    search_fields = ['name']
+                Prefetch(
+                    'transported_items',
+                    queryset=TransportedProducts.objects.select_related(
+                        'product',
+                        'product__category_id'  
+                    )
+                )
+            ).annotate(
+                total_products=Count('transported_items'),
+                total_quantity=Sum('transported_items__quantity')
+            ).order_by('-date_of_transaction')
 
-class PhoneBrandRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Brand.objects.all()
-    serializer_class = BrandSerializer
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    lookup_field = 'brand_id'
+            transactions = self.filter_queryset(transactions)
 
-# Color Views
-class ColorListCreateView(generics.ListCreateAPIView):
-    queryset = Color.objects.all()
-    serializer_class = ColorSerializer
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    filterset_fields = ['is_active']
-    search_fields = ['name']
+            page = self.paginate_queryset(transactions)
+            if page is not None:
+                serializer = ProductTransactionListSerializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
 
-class ColorRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Color.objects.all()
-    serializer_class = ColorSerializer
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    lookup_field = 'color_id'
+            serializer = ProductTransactionListSerializer(transactions, many=True)
+            return Response(serializer.data)
 
-# Accessory Type Views
-class AccessoryTypeListCreateView(generics.ListCreateAPIView):
-    queryset = AccessoriesType.objects.all()
-    serializer_class = AccessoriesTypeSerializer
-    permission_classes = [IsAuthenticated, IsWarehouseManager]
-    filterset_fields = ['is_active']
-    search_fields = ['name']
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
-class AccessoryTypeRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = AccessoriesType.objects.all()
-    serializer_class = AccessoriesTypeSerializer
+
+class ProductTransactionDetailView(GenericAPIView):#used
     permission_classes = [IsAuthenticated, IsWarehouseManager]
-    lookup_field = 'accessory_type_id'
+
+    def get(self, request, pk):
+        
+        try:
+            transaction = ProductTransaction.objects.select_related(
+                'branch_id'
+            ).prefetch_related(
+                Prefetch(
+                    'transported_items',
+                    queryset=TransportedProducts.objects.select_related(
+                        'product',
+                        'product__category_id'  
+                    )
+                )
+            ).get(pk=pk)
+
+            transaction_data = {
+                "transaction_id": transaction.process_id,
+                "date": transaction.date_of_transaction,
+                "branch_location": transaction.branch_id.location,
+                "branch_number": transaction.branch_id.branch_number,
+                "movement_type": transaction.movement_type,
+                "is_done": transaction.is_done,
+                "products": []
+            }
+
+            for item in transaction.transported_items.all():
+                transaction_data["products"].append({
+                    "product_id": item.product.product_id,
+                    "product_name": item.product.product_name,
+                    "category_name": item.product.category_id.category_name, 
+                    "main_price": float(item.main_price),
+                    "selling_price": float(item.selling_price)
+                })
+
+            return Response(transaction_data)
+
+        except ProductTransaction.DoesNotExist:
+            return Response(
+                {"error": "Transaction not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            
+
+
+class WareHouseRequestsLogView(GenericAPIView):##used
+    
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter,OrderingFilter]
+    filterset_class = BranchOrderRequestsFilter 
+    pagination_class = PageNumberPagination
+    search_fields = [ 'requestedproducts_set__product_id__product_name']
+    ordering_fields = ['date_of_order', 'branch_id__location']
+    ordering = ['-date_of_order']
+    def get(self, request):
+        try:
+            queryset = BranchOrder.objects.select_related(
+                'branch_id'
+            ).prefetch_related(
+                Prefetch(
+                    'requestedproducts_set',
+                    queryset=RequestedProducts.objects.select_related(
+                        'product_id',
+                        'product_id__category_id'
+                    )
+                )
+            ).order_by('-date_of_order')
+
+            
+            print(str(queryset.query))
+
+            
+            filtered_queryset = self.filter_queryset(queryset)
+            
+            print(str(filtered_queryset.query))
+
+        
+            response_data = []
+            for order in filtered_queryset:
+                order_data = {
+                    "order_id": order.order_id,
+                    "date_of_order": order.date_of_order.strftime('%Y-%m-%d'),
+                    "branch_location": order.branch_id.location,
+                    "branch_number": order.branch_id.branch_number,
+                    "total_requested_products": order.requestedproducts_set.count(),
+                    "products": []
+                }
+
+                for item in order.requestedproducts_set.all():
+                    product_data = {
+                        "product_id": item.product_id.product_id,
+                        "product_name": item.product_id.product_name,
+                        "category": item.product_id.category_id.category_name,
+                        "quantity": item.quantity,
+                        "status": item.status,
+                    }
+                    order_data["products"].append(product_data)
+
+                response_data.append(order_data)
+
+            page = self.paginate_queryset(response_data)
+            if page is not None:
+                return self.get_paginated_response(page)
+
+            return Response(response_data)
+
+        except Exception as e:
+            return Response(
+                {"error": str(e), "detail": "Filter processing failed"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+
+## logging 
+
+class ActivityLogListView(generics.ListAPIView):
+    queryset = ActivityLog.objects.all().order_by('-timestamp')
+    serializer_class = ActivityLogSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['user', 'action', 'model_name', 'timestamp']
+    permission_classes = [IsAdminUser,IsActiveSuperAdmin]  
